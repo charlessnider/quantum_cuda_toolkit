@@ -1,3 +1,12 @@
+/* CUSTOM REPLACERS FOR COMPLEX FLOAT ARITHMETIC ON DEVICE TO IMPROVE ACCURACY */
+//
+//      my_cuCoperationf(cuFloatComplex x, cuFloatComplex y)
+//          perform -operation- on x, y using device intrinsics to improve accuracy of complex float arithmetic
+//          operation = add, mul, sub, div
+//          for sub, div outputs x-y, x/y
+//
+/*                                                                             */
+
 // CUSTOM ARITHMETIC FOR ACCURACY
 
 __device__ static __inline__ cuFloatComplex my_cuCaddf(cuFloatComplex x, cuFloatComplex y){

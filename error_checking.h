@@ -1,3 +1,20 @@
+/*          CUDA FUNCTIONS FOR ERROR CHECKING, LOGGING (TAKEN BASICALLY STRAIGHT FROM STACKOVERFLOW)         */
+/*                                    https://stackoverflow.com/a/14038590                                   */
+/*                     LIST CUBLAS ERRORS TAKEN FROM https://stackoverflow.com/a/13041801                    */
+/*                                     LIST CUSOLVER ERRORS TAKEN FROM                                       */
+/* https://github.com/NVIDIA/cuda-samples/blob/81992093d2b8c33cab22dbf6852c070c330f1715/Common/helper_cuda.h */
+//
+//      CUDA_CHECK(function call)
+//          check for cuda errors, abort program and print cuda error string & line of cuda error to console
+//
+//      CUSOLVER_CHECK(function call)
+//          same as above, but for a cuSolver call
+//
+//      CUBLAS_CHECK(funciton call)
+//          same as above, but for a cuBLAS call
+// 
+/*                                                                                                           */
+
 // ERROR CHECKING FUNCTIONS (THANKS STACKOVERFLOW)
 
 #define CUDA_CHECK(ans) { gpuAssert_cuda((ans), __FILE__, __LINE__); }

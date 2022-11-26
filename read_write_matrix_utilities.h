@@ -1,3 +1,21 @@
+/* UTILITIES FOR WRITING, READING MATRICES FROM TEXT FILES */
+//
+//      write_matrix_to_file_T(T* matrix_to_write, string name_of_output_file, int size_of_matrix)
+//          write a matrix of type T (C, Z = complex float, double, F, D = float, double) to a text file
+//              matrix should be in memory in ROW MAJOR order (i,j) -> k = dim * i + j
+//          text file name = "name_of_output_file.txt" if real valued matrix
+//          two outputs for complex matrices: "real_name_of_output_file.txt", "imag_name_of_output_file.txt"
+//
+//      write_vector_to_file_T(T* vector_to_write, string name_of_output_file, int size_of_vector)
+//          same as above, but for a vector (1d) rather than matrix (2d)
+//
+//      read_array_from_file_T(T* pointer_to_matrix, string name_of_input_file)
+//          read a matrix/vector of type T (C, Z = complex float, double, F, D = float, double) from a text file
+//              matrix/vector is saved in memory at pointer_to_matrix in ROW MAJOR order (i,j) -> k = dim * i + j
+//          for complex data types, reads from text files "real_name_of_input_file.txt" and "imag_name_of_input_file.txt", for real data types reads from "name_of_input_file.txt"
+//
+/*                                                         */
+
 // WRITE MATRICES, VECTORS TO FILES
 
 void write_matrix_to_file_C(cuFloatComplex* M, std::string M_name, int dim){
