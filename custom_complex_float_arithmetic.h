@@ -5,7 +5,6 @@
 //          operation = add, mul, sub, div
 //          for sub, div outputs x-y, x/y
 //
-/*                                                                             */
 
 // CUSTOM ARITHMETIC FOR ACCURACY
 

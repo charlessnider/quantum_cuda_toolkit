@@ -13,7 +13,6 @@
 //      CUBLAS_CHECK(funciton call)
 //          same as above, but for a cuBLAS call
 // 
-/*                                                                                                           */
 
 // ERROR CHECKING FUNCTIONS (THANKS STACKOVERFLOW)
 
