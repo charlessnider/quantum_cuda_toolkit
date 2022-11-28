@@ -7,6 +7,23 @@
 //          compute eigenvalues and eigenvectors of hermitian matrix A
 //          eigenvalues are saved to real valued 1d array D, eigenvectors overwrite matrix A
 //
+//      class cuHandles: creates cuSolver and cuBLAS handles in one go, to avoid doing it multiple times
+
+
+// CLASS TO HOLD CUBLAS, CUSOLVER HANDLES
+class cuHandles{
+    public:
+        
+        // cuBLAS and cuSolver handles
+        cublasHandle_t cublasH;
+        cusolverDnHandle_t cusolverH;
+
+        // initialize the handles in constructor
+        cuHandles(){
+            CUBLAS_CHECK(cublasCreate(&cublasH));
+            CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
+        }
+};
 
 // MATRIX OPERATIONS
 __global__ void kron(cuFloatComplex* A, cuFloatComplex* B, cuFloatComplex* C, int dim_A, int dim_B){
@@ -34,11 +51,11 @@ __global__ void kron(cuFloatComplex* A, cuFloatComplex* B, cuFloatComplex* C, in
 }
 
 // EIGENSOLVER
-void eigensolve(cuFloatComplex* A, float* D, int dim){
+void eigensolve(cuFloatComplex* A, float* D, int dim, cuHandles x){
 
     // create the solver handle
-    cusolverDnHandle_t cusolverH;
-    CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
+    // cusolverDnHandle_t cusolverH;
+    // CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
     
     // bits and pieces for solver
     int* devInfo;           // indicates type of success/failure of solver
@@ -59,11 +76,11 @@ void eigensolve(cuFloatComplex* A, float* D, int dim){
     cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
 
     // compute amount of memory needed, and allocate on device
-    CUSOLVER_CHECK(cusolverDnCheevd_bufferSize(cusolverH, jobz, uplo, n, A, lda, D, &lwork));
+    CUSOLVER_CHECK(cusolverDnCheevd_bufferSize(x.cusolverH, jobz, uplo, n, A, lda, D, &lwork));
     CUDA_CHECK(cudaMalloc(&work, lwork * sizeof(cuFloatComplex)));
 
     // (palpatine voice) do it
-    CUSOLVER_CHECK(cusolverDnCheevd(cusolverH, jobz, uplo, n, A, lda, D, work, lwork, devInfo));
+    CUSOLVER_CHECK(cusolverDnCheevd(x.cusolverH, jobz, uplo, n, A, lda, D, work, lwork, devInfo));
 
     // free memory on device just in case, idk
     CUDA_CHECK(cudaFree(devInfo)); CUDA_CHECK(cudaFree(work));
