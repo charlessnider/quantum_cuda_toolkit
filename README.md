@@ -4,7 +4,7 @@ continuation of phd dissertation work.  pet project to write functions useful fo
 
 uses a lot of cuBLAS, cuSolver.
 
-ultimately will start putting together algorithms, eg cuda based dmrg
+ultimately will start putting together algorithms, eg cuda based dmrg as practice in both cuda and dmrg
 
 no promises how good or standard anything is, i'm self taught in both cuda and c++.
 
