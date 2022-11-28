@@ -14,6 +14,12 @@
 //              matrix/vector is saved in memory at pointer_to_matrix in ROW MAJOR order (i,j) -> k = dim * i + j
 //          for complex data types, reads from text files "real_name_of_input_file.txt" and "imag_name_of_input_file.txt", for real data types reads from "name_of_input_file.txt"
 //
+//      void print_complex(cuFloatComplex val)
+//          prints a complex value, cuz i'm lazy and don't wanna write it
+
+void print_complex(cuFloatComplex val){
+    std::cout << cuCrealf(val) << " + " << cuCimagf(val) << "i\n";
+}
 
 // WRITE MATRICES, VECTORS TO FILES
 

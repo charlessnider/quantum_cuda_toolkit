@@ -32,12 +32,56 @@
 // size of matrix in question
 int DIM = 1024;
 
+// MATRIX TRACE
+cuFloatComplex trace(cuFloatComplex* d_A, int dim, cuHandles x){
+
+    // use dot product to calculate trace, idea stolen from scikit-cuda
+    // https://scikit-cuda.readthedocs.io/en/latest/_modules/skcuda/linalg.html#trace
+    
+    // just a single value of 1
+    cuFloatComplex h_one = make_cuFloatComplex(1,0);
+    cuFloatComplex* one; CUDA_CHECK(cudaMalloc(&one, sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMemcpy(one, &h_one, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+
+    // trace value to return
+    cuFloatComplex result;
+
+    // increment step: for A, increment by matrix dimension dim, for B do not increment (incy = 0)
+    int incx = dim + 1;
+    int incy = 0;
+
+    // crunch it
+    CUBLAS_CHECK(cublasCdotu(x.cublasH, dim, d_A, incx, one, incy, &result));
+
+    // free the memory just in case
+    CUDA_CHECK(cudaFree(one));
+
+    // return the trace
+    return result;
+}
+
 // PREPROCESSING
-void pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int scale_factor){
+cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int scale_factor){
 
     // calculate trace
+    cuFloatComplex TrA = trace(d_A, dim, x);
 
-    // subtract trace times identity from A
+    // scale by matrix dimension
+    TrA = cuCdivf(TrA, make_cuFloatComplex(float(dim), 0));
+
+    // just a single value of -1
+    cuFloatComplex h_one = make_cuFloatComplex(-1,0);
+    cuFloatComplex* one; CUDA_CHECK(cudaMalloc(&one, sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMemcpy(one, &h_one, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+
+    // increment step: for A, increment by matrix dimension dim, for B do not increment (incy = 0)
+    int incx = 0;
+    int incy = dim + 1;
+
+    // subtract off the trace using the same trick as when calculating the trace
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim, &TrA, one, incx, d_A, incy));
+
+    // balance the matrix
 
     // calculate matrix norm
 
@@ -45,11 +89,17 @@ void pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int scale_factor){
 
     // scale
     cuFloatComplex s = cuCdivf(make_cuFloatComplex(1, 0), make_cuFloatComplex(scale_factor, 0));
-    cublasCscal(x.cublasH, dim * dim, &s, d_A, 1);
+    CUBLAS_CHECK(cublasCscal(x.cublasH, dim * dim, &s, d_A, 1));
+
+    // free the memory just in case
+    CUDA_CHECK(cudaFree(one));
+
+    // return the trace, for use later
+    return TrA;
 }
 
 // POSTPROCESSING
-void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, int dim, cuHandles x, int num_squares){
+void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, int dim, cuHandles x, int num_squares){
 
     // identity and zero values
     cuFloatComplex id = make_cuFloatComplex(1, 0); cuFloatComplex z = make_cuFloatComplex(0, 0);
@@ -99,11 +149,26 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, int dim, cuHandles x
         }
     }
 
-    // scale by exp(tr A)
+    // undo balancing
+
+    // calculate magnitude and argument of TrA for exponential
+    float r = cuCabsf(TrA);
+    float arg = atan2f(cuCimagf(TrA), cuCrealf(TrA));
+
+    // put the values together to get exp(Tr A)
+    // = exp(Tr A) = exp[ r exp(i arg) ] 
+    // = exp[ r cos(arg) + i r sin(arg)] 
+    // = exp[ r cos(arg) ] * [ cos(r sin(arg)) + i sin(r sin(arg)) ]
+    cuFloatComplex exp_TrA = make_cuFloatComplex(expf(r * cosf(arg)) * cosf(r * sinf(arg)), 
+                                                 expf(r * cosf(arg)) * sinf(r * sinf(arg)));
+
+    // scale the matrix d_X which holds the result
+    CUBLAS_CHECK(cublasCscal(x.cublasH, dim * dim, &exp_TrA, d_X, 1));
 
     // free all allocated cuda memory just in case
     CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y));
 }
+
 
 // LINSOLVE
 void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
@@ -130,6 +195,7 @@ void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 }
 
 // PADE APPROXIMANT POLYNOMIALS
+// change this to reduce number of multiplications, see http://eprints.ma.man.ac.uk/634/1/high05e.pdf
 void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 
     // identity and zero values
@@ -290,7 +356,7 @@ int main(){
     auto net_start = std::chrono::high_resolution_clock::now();
 
     // pre-process matrix by scaling, subtracting the trace, etc
-    pre_process(d_A, dim, x, scale_factor);
+    cuFloatComplex TrA = pre_process(d_A, dim, x, scale_factor);
 
     // print time of execution
     cudaDeviceSynchronize();
@@ -326,7 +392,7 @@ int main(){
     start = std::chrono::high_resolution_clock::now();
 
     // reverse scaling, multiply by exp(-trace)
-    post_process(d_P, d_X, dim, x, num_squares);
+    post_process(d_P, d_X, TrA, dim, x, num_squares);
 
     // print time of execution
     cudaDeviceSynchronize();
