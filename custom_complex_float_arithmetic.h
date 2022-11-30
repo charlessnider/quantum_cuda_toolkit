@@ -9,20 +9,25 @@
 // CUSTOM ARITHMETIC FOR ACCURACY
 
 __device__ static __inline__ cuFloatComplex my_cuCaddf(cuFloatComplex x, cuFloatComplex y){
+
     float re_z = __fadd_rn(cuCrealf(x), cuCrealf(y));
     float im_z = __fadd_rn(cuCimagf(x), cuCimagf(y));
 
     cuFloatComplex z = make_cuFloatComplex(re_z, im_z);
     return z;
 }
+
 __device__ static __inline__ cuFloatComplex my_cuCsubf(cuFloatComplex x, cuFloatComplex y){
+
     float re_z = __fsub_rn(cuCrealf(x), cuCrealf(y));
     float im_z = __fsub_rn(cuCimagf(x), cuCimagf(y));
 
     cuFloatComplex z = make_cuFloatComplex(re_z, im_z);
     return z;
 }
+
 __device__ static __inline__ cuFloatComplex my_cuCmulf(cuFloatComplex x, cuFloatComplex y){
+
     float re_z_L = __fmul_rn(cuCrealf(x), cuCrealf(y));
     float re_z_R = __fmul_rn(cuCimagf(x), cuCimagf(y));
     float re_z = __fsub_rn(re_z_L, re_z_R);
@@ -34,7 +39,9 @@ __device__ static __inline__ cuFloatComplex my_cuCmulf(cuFloatComplex x, cuFloat
     cuFloatComplex z = make_cuFloatComplex(re_z, im_z);
     return z;
 }
+
 __device__ static __inline__ cuFloatComplex my_cuCdivf(cuFloatComplex x, cuFloatComplex y){
+
     // scaling
     float re_s = (float) fabs((double) cuCrealf(y));
     float im_s = (float) fabs((double) cuCimagf(y));
@@ -64,5 +71,12 @@ __device__ static __inline__ cuFloatComplex my_cuCdivf(cuFloatComplex x, cuFloat
     // result
     cuFloatComplex z = make_cuFloatComplex(re_z, im_z);
     return z;
+
+}
+
+__device__ static __inline__ float my_cuCabsf(cuFloatComplex x){
+
+    float r = __fsqrt_rn(__fadd_rn(__fmul_rn(cuCrealf(x), cuCrealf(x)), __fmul_rn(cuCimagf(x), cuCimagf(x))));
+    return r;
 
 }

@@ -60,8 +60,24 @@ cuFloatComplex trace(cuFloatComplex* d_A, int dim, cuHandles x){
     return result;
 }
 
+__global__ void column_sum(cuFloatComplex* d_A, float* normA, int dim){
+
+    // one thread gets each column
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // if threads < dim, run it
+    if (idx < dim){
+
+        float temp = 0;
+        for (int i = 0; i < dim; i++){
+            temp = temp + my_cuCabsf(d_A[dim * i + idx]);
+        }
+        normA[idx] = temp;
+    }
+}
+
 // PREPROCESSING
-cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int scale_factor){
+cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int* nsquares){
 
     // calculate trace
     cuFloatComplex TrA = trace(d_A, dim, x);
@@ -83,23 +99,38 @@ cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int scale_
 
     // balance the matrix
 
-    // calculate matrix norm
+    // calculate matrix norm (maximal column sum)
+    float* normA; CUDA_CHECK(cudaMalloc(&normA, dim * sizeof(float)));
+    column_sum <<< 1 + dim/32, 32 >>> (d_A, normA, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize()); // check errors for kernel
 
-    // calculate scale factor
+    // get maximal column sum to decide scale factor
+    int idx;
+    CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, normA, 1, &idx));
+
+    // copy over value of maximal column sum to host
+    float nA; CUDA_CHECK(cudaMemcpy(&nA, normA + idx, sizeof(float), cudaMemcpyDeviceToHost));
+
+    // calculate log2(scale factor) & save for later
+    *nsquares = (int) ceilf(log2f(nA / 5.371920351148152));
+    std::cout << *nsquares << std::endl;
+
+    // get scale factor itself (2^n)
+    cuFloatComplex s = make_cuFloatComplex(powf(2, -(*nsquares)), 0);
+    std::cout << cuCrealf(s) << std::endl;
 
     // scale
-    cuFloatComplex s = cuCdivf(make_cuFloatComplex(1, 0), make_cuFloatComplex(scale_factor, 0));
     CUBLAS_CHECK(cublasCscal(x.cublasH, dim * dim, &s, d_A, 1));
 
     // free the memory just in case
-    CUDA_CHECK(cudaFree(one));
+    CUDA_CHECK(cudaFree(one)); CUDA_CHECK(cudaFree(normA));
 
     // return the trace, for use later
     return TrA;
 }
 
 // POSTPROCESSING
-void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, int dim, cuHandles x, int num_squares){
+void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, int dim, cuHandles x, int* nsquares){
 
     // identity and zero values
     cuFloatComplex id = make_cuFloatComplex(1, 0); cuFloatComplex z = make_cuFloatComplex(0, 0);
@@ -111,8 +142,8 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, 
     // first square, store in y
     CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_P, dim, d_P, dim, &z, d_y, dim));
 
-    // square the rest, copy memory to solution space X when done
-    // int num_squares = 2;
+    // number of required squarings = value at nsquares
+    int num_squares = *nsquares;
 
     // if only one square, copy to X right away
     if (num_squares == 1){
@@ -340,14 +371,13 @@ int main(){
     cuHandles x;
 
     // squaring step
-    int scale_factor = 2;
-    int num_squares = 1;
+    int* nsquares = new int;
 
     // print time of execution
     cudaDeviceSynchronize();
     end = std::chrono::high_resolution_clock::now();
     duration = end - start;
-    std::cout << "The total elapsed time to allocate memory, copy A to device, and create solver, BLAS handles was " << duration.count() << "s" << std::endl;
+    std::cout << "The total elapsed time to allocate memory, copy A to device, and create handles was " << duration.count() << "s" << std::endl;
     
     // start timing
     start = std::chrono::high_resolution_clock::now();
@@ -356,7 +386,7 @@ int main(){
     auto net_start = std::chrono::high_resolution_clock::now();
 
     // pre-process matrix by scaling, subtracting the trace, etc
-    cuFloatComplex TrA = pre_process(d_A, dim, x, scale_factor);
+    cuFloatComplex TrA = pre_process(d_A, dim, x, nsquares);
 
     // print time of execution
     cudaDeviceSynchronize();
@@ -392,7 +422,7 @@ int main(){
     start = std::chrono::high_resolution_clock::now();
 
     // reverse scaling, multiply by exp(-trace)
-    post_process(d_P, d_X, TrA, dim, x, num_squares);
+    post_process(d_P, d_X, TrA, dim, x, nsquares);
 
     // print time of execution
     cudaDeviceSynchronize();
