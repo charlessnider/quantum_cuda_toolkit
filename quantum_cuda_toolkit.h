@@ -34,8 +34,8 @@ __global__ void kron(cuFloatComplex* A, cuFloatComplex* B, cuFloatComplex* C, in
     if (idx < dim_A * dim_B * dim_A * dim_B){
 
         // get indices of matrix C from flattened form
-        int j_C = idx % (dim_A * dim_B);
-        int i_C = (idx - j_C) / (dim_A * dim_B);
+        int i_C = idx % (dim_A * dim_B);
+        int j_C = (idx - i_C) / (dim_A * dim_B);
 
         // index of matrix A to fetch
         int i_B = i_C % dim_B;
@@ -45,8 +45,8 @@ __global__ void kron(cuFloatComplex* A, cuFloatComplex* B, cuFloatComplex* C, in
         int i_A = (i_C - i_B) / dim_B;
         int j_A = (j_C - j_B) / dim_B;
 
-        // C(i,j) = A(i_A, j_A) * B(i_B, j_B)
-        C[idx] = my_cuCmulf(A[dim_A * i_A + j_A], B[dim_B * i_B + j_B]);
+        // C(i,j) = A(i_A, j_A) * B(i_B, j_B) in COLUMN MAJOR ORDER (i,j) -> dim * j + i
+        C[idx] = my_cuCmulf(A[dim_A * j_A + i_A], B[dim_B * j_B + i_B]);
     }
 }
 
@@ -67,19 +67,19 @@ void eigensolve(cuFloatComplex* A, float* D, int dim, cuHandles x){
 
     // parameters for the solver here
     int lwork = 0;
-    cuFloatComplex* work = NULL;
+    cuFloatComplex* work = nullptr;
 
     // whether to save the eigenvectors
     cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR;
 
     // probably solver only uses part of matrix (since symmetric) & this specifics which half you are supplying
-    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
+    cublasFillMode_t uplo = CUBLAS_FILL_MODE_FULL; //CUBLAS_FILL_MODE_LOWER;
 
     // compute amount of memory needed, and allocate on device
     CUSOLVER_CHECK(cusolverDnCheevd_bufferSize(x.cusolverH, jobz, uplo, n, A, lda, D, &lwork));
     CUDA_CHECK(cudaMalloc(&work, lwork * sizeof(cuFloatComplex)));
 
-    // (palpatine voice) do it
+    // (palpatine voice) do it-- can maybe use cusolverDnCheevdx to calculate only SOME eigvecs if don't need all of them
     CUSOLVER_CHECK(cusolverDnCheevd(x.cusolverH, jobz, uplo, n, A, lda, D, work, lwork, devInfo));
 
     // free memory on device just in case, idk

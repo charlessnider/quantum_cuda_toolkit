@@ -70,7 +70,7 @@ __global__ void column_sum(cuFloatComplex* d_A, float* normA, int dim){
 
         float temp = 0;
         for (int i = 0; i < dim; i++){
-            temp = temp + my_cuCabsf(d_A[dim * i + idx]);
+            temp = temp + my_cuCabsf(d_A[dim * idx + i]);
         }
         normA[idx] = temp;
     }
@@ -113,11 +113,9 @@ cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int* nsqua
 
     // calculate log2(scale factor) & save for later
     *nsquares = (int) ceilf(log2f(nA / 5.371920351148152));
-    std::cout << *nsquares << std::endl;
 
     // get scale factor itself (2^n)
     cuFloatComplex s = make_cuFloatComplex(powf(2, -(*nsquares)), 0);
-    std::cout << cuCrealf(s) << std::endl;
 
     // scale
     CUBLAS_CHECK(cublasCscal(x.cublasH, dim * dim, &s, d_A, 1));
@@ -140,7 +138,7 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, 
     cuFloatComplex* d_y; CUDA_CHECK(cudaMalloc(&d_y, dim * dim * sizeof(cuFloatComplex)));
 
     // first square, store in y
-    CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_P, dim, d_P, dim, &z, d_y, dim));
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_P, dim, d_P, dim, &z, d_y, dim));
 
     // number of required squarings = value at nsquares
     int num_squares = *nsquares;
@@ -157,7 +155,7 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, 
         if (idx % 2 == 0 || idx == 0)
         {
             // calculate the product
-            CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_y, dim, d_y, dim, &z, d_x, dim));
+            CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_y, dim, d_y, dim, &z, d_x, dim));
 
             // if at the last index, copy to non-temporary memory
             if (idx == num_squares - 2)
@@ -170,7 +168,7 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, 
         else
         {
             // calculate the product
-            CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_x, dim, d_x, dim, &z, d_y, dim));
+            CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_x, dim, d_x, dim, &z, d_y, dim));
 
             // if at the last index, copy to non-temporary memory
             if (idx == num_squares - 2)
@@ -200,7 +198,6 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, 
     CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y));
 }
 
-
 // LINSOLVE
 void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
     
@@ -210,7 +207,7 @@ void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 
     // parameters for the solver here
     int lwork = 0;
-    cuFloatComplex* work = NULL;
+    cuFloatComplex* work = nullptr;
 
     // get size of buffer
     CUSOLVER_CHECK(cusolverDnCgetrf_bufferSize(x.cusolverH, dim, dim, d_Q, dim, &lwork));
@@ -221,13 +218,16 @@ void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
     // factorize
     CUSOLVER_CHECK(cusolverDnCgetrf(x.cusolverH, dim, dim, d_Q, dim, work, d_ipiv, devInfo));
 
-    // solve & overwrite P with solution X
+    // solve & overwrite P with solution X (solves QX = P)
     CUSOLVER_CHECK(cusolverDnCgetrs(x.cusolverH, CUBLAS_OP_N, dim, dim, d_Q, dim, d_ipiv, d_P, dim, devInfo));
+
+    // free memory just in case
+    CUDA_CHECK(cudaFree(d_ipiv)); CUDA_CHECK(cudaFree(devInfo)); CUDA_CHECK(cudaFree(work));
 }
 
 // PADE APPROXIMANT POLYNOMIALS
 // change this to reduce number of multiplications, see http://eprints.ma.man.ac.uk/634/1/high05e.pdf
-void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
+void calc_PQ_seq(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 
     // identity and zero values
     cuFloatComplex id = make_cuFloatComplex(1, 0); cuFloatComplex z = make_cuFloatComplex(0, 0);
@@ -292,7 +292,7 @@ void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int 
     CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &coefQ[1], d_A, 1, d_Q, 1));
 
     // calculate A * A, store in x
-    CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_A, dim, &z, d_x, dim));
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_A, dim, &z, d_x, dim));
 
     // add to Q and P
     CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &coefP[2], d_x, 1, d_P, 1));
@@ -305,7 +305,7 @@ void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int 
         if (idx % 2 == 0 || idx == 0)
         {
             // calculate the product
-            CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_x, dim, &z, d_y, dim));
+            CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_x, dim, &z, d_y, dim));
 
             // add to P or Q
             CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &coefP[idx + 3], d_y, 1, d_P, 1));
@@ -316,7 +316,7 @@ void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int 
         else
         {
             // calculate the product
-            CUBLAS_CHECK(cublasCgemm(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_y, dim, &z, d_x, dim));
+            CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_y, dim, &z, d_x, dim));
 
             // add to P or Q
             CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &coefP[idx + 3], d_x, 1, d_P, 1));
@@ -326,6 +326,114 @@ void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int 
 
     // free all allocated cuda memory just in case
     CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y));
+}
+
+// FASTER WAY TO CALCULATE P AND Q-- ONLY 6 MULTIPLICATIONS
+void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
+
+    // identity and zero values
+    cuFloatComplex id = make_cuFloatComplex(1, 0); cuFloatComplex mid = make_cuFloatComplex(-1,0); 
+    cuFloatComplex z = make_cuFloatComplex(0, 0); 
+
+    // need a copy of z, id
+    cuFloatComplex* d_z; CUDA_CHECK(cudaMalloc(&d_z, sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMemcpy(d_z, &z, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+    cuFloatComplex* d_id; CUDA_CHECK(cudaMalloc(&d_id, sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMemcpy(d_id, &id, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+
+    // memory for pade approximant coefficients
+    cuFloatComplex* C = new cuFloatComplex[14];
+
+    // load the coefficients
+    C[0] = make_cuFloatComplex(float(64764752532480000), float(0));
+    C[1] = make_cuFloatComplex(float(32382376266240000), float(0));
+    C[2] = make_cuFloatComplex(float(7771770303897600), float(0));
+    C[3] = make_cuFloatComplex(float(1187353796428800), float(0));
+    C[4] = make_cuFloatComplex(float(129060195264000), float(0));
+    C[5] = make_cuFloatComplex(float(10559470521600), float(0));
+    C[6] = make_cuFloatComplex(float(670442572800), float(0));
+    C[7] = make_cuFloatComplex(float(33522128640), float(0));
+    C[8] = make_cuFloatComplex(float(1323241920), float(0));
+    C[9] = make_cuFloatComplex(float(40840800), float(0));
+    C[10] = make_cuFloatComplex(float(960960), float(0));
+    C[11] = make_cuFloatComplex(float(16380), float(0));
+    C[12] = make_cuFloatComplex(float(182), float(0));
+    C[13] = make_cuFloatComplex(float(1), float(0));
+
+    // memory for A2 = A * A, A4 = A2 * A2, A6 = A4 * A2
+    cuFloatComplex* A2; CUDA_CHECK(cudaMalloc(&A2, dim * dim * sizeof(cuFloatComplex)));
+    cuFloatComplex* A4; CUDA_CHECK(cudaMalloc(&A4, dim * dim * sizeof(cuFloatComplex)));
+    cuFloatComplex* A6; CUDA_CHECK(cudaMalloc(&A6, dim * dim * sizeof(cuFloatComplex)));
+
+    // initialize A2, A4, A6
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, A2, 1));
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, A4, 1));
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, A6, 1));
+
+    // intermediate storage
+    cuFloatComplex* U1; CUDA_CHECK(cudaMalloc(&U1, dim * dim * sizeof(cuFloatComplex)));
+    cuFloatComplex* U2; CUDA_CHECK(cudaMalloc(&U2, dim * dim * sizeof(cuFloatComplex)));
+    cuFloatComplex* V1; CUDA_CHECK(cudaMalloc(&V1, dim * dim * sizeof(cuFloatComplex)));
+    cuFloatComplex* V2; CUDA_CHECK(cudaMalloc(&V2, dim * dim * sizeof(cuFloatComplex)));
+
+    // calculate A2 = A * A (store in A2)
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, d_A, dim, &z, A2, dim));
+
+    // calculate A4 = A2 * A2 (store in A4)
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, A2, dim, A2, dim, &z, A4, dim));
+
+    // calculate A6 = A2 * A4 (store in A6)
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, A2, dim, A4, dim, &z, A6, dim));
+
+    // calculate U1 = C13 * A6 + C11 * A4 + C9 * A2 (initialize to zero first)
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, U1, 1));
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[13], A6, 1, U1, 1)); // add C13 * A6, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[11], A4, 1, U1, 1)); // add C11 * A4, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[9], A2, 1, U1, 1));  // add C9 * A2, overwriting
+
+    // calculate U2 = C7 * A6 + C5 * A4 + C3 * A2 + C1 * I (initialize to zero first)
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, U2, 1));
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[7], A6, 1, U2, 1));  // add C7 * A6, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[5], A4, 1, U2, 1));  // add C5 * A4, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[3], A2, 1, U2, 1));  // add C3 * A2, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim, &C[1], d_id, 0, U2, dim + 1)); // add C1 * I, overwriting
+
+    // calculate V1 = C12 * A6 + C10 * A4 + C8 * A2 (initialize to zero first)
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, V1, 1));
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[12], A6, 1, V1, 1)); // add C12 * A6, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[10], A4, 1, V1, 1)); // add C10 * A4, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[8], A2, 1, V1, 1));  // add C8 * A2, overwriting
+
+    // calculate V2 = C6 * A6 + C4 * A4 + C2 * A2 + C0 * I (initialize to zero first)
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, d_z, 0, V2, 1));
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[6], A6, 1, V2, 1));  // add C6 * A6, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[4], A4, 1, V2, 1));  // add C4 * A4, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &C[2], A2, 1, V2, 1));  // add C2 * A2, overwriting
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim, &C[0], d_id, 0, V2, dim + 1)); // add C0 * I, overwriting
+
+    // left multiply U1, V1 by A6 (store A6 * U1 in A2, A6 * V1 in A4, since do not need these anymore)
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, A6, dim, U1, dim, &id, U2, dim));
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, A6, dim, V1, dim, &id, V2, dim));
+
+    // last multiplication: left multiply A6 * U1 + U2 (stored in U2) by A to get U, store in U1
+    CUBLAS_CHECK(cublasCgemm3m(x.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &id, d_A, dim, U2, dim, &z, U1, dim));
+
+    // copy V (stored in V2) to P to calculate P = V + U
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, V2, 1, d_P, 1));
+
+    // add U (stored in U1) to P
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &id, U1, 1, d_P, 1)); // P = V + U, overwrites P
+
+    // copy V (stored in V2) to Q to calculate Q = V - U
+    CUBLAS_CHECK(cublasCcopy(x.cublasH, dim * dim, V2, 1, d_Q, 1));
+
+    // subtract U (stored in U1) from Q
+    CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &mid, U1, 1, d_Q, 1)); // Q = V - U, overwrites Q
+
+    // free all allocated cuda memory just in case
+    CUDA_CHECK(cudaFree(U1));  CUDA_CHECK(cudaFree(U2));  CUDA_CHECK(cudaFree(V1));  CUDA_CHECK(cudaFree(V2));
+    CUDA_CHECK(cudaFree(A2));  CUDA_CHECK(cudaFree(A4));  CUDA_CHECK(cudaFree(A6));
+    CUDA_CHEKC(cudaFree(d_z)); CUDA_CHECK(cudaFree(d_id));
 }
 
 int main(){
@@ -451,7 +559,7 @@ int main(){
 
     // write X to file for error checking
     std::string x_name = "X";
-    write_matrix_to_file_C(h_X, x_name, dim);
+    write_array_to_file_C(h_X, x_name, dim * dim);
 
     // print time of execution
     cudaDeviceSynchronize();
@@ -504,7 +612,7 @@ int main(){
 
     // save to file
     std::string c_name = "C";
-    write_matrix_to_file_C(h_C, c_name, dim_A * dim_B);
+    write_array_to_file_C(h_C, c_name, dim_A * dim_B * dim_A * dim_B);
 
     // free memory
     delete [] h_A; delete [] h_B; delete [] h_C;
@@ -570,8 +678,8 @@ int main(){
 
     // write to files
     std::string d_name = "D"; std::string u_name = "U";
-    write_vector_to_file_F(h_D, d_name, DIM);
-    write_matrix_to_file_C(h_U, u_name, DIM);
+    write_array_to_file_F(h_D, d_name, DIM);
+    write_array_to_file_C(h_U, u_name, DIM * DIM);
 
     // print the time taken to eigensolve
     cudaDeviceSynchronize();
