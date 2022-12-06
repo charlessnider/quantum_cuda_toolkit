@@ -1,14 +1,14 @@
 /* UTILITIES FOR WRITING, READING MATRICES FROM TEXT FILES */
 //
 //      void write_array_to_file_T(T* matrix_to_write, string name_of_output_file, int number_of_elements)
-//          write an array of type T (C, Z = complex float, double, F, D = float, double) to a text file
+//          write an array of type T (C, Z = complex float, double, S, D = float, double) to a text file
 //              matrices should be in memory in COLUMN MAJOR order (i,j) -> k = dim * j + i
 //              cuBLAS routines use column major order, ugh
 //          text file name = "name_of_output_file.txt" if real valued matrix
 //          two outputs for complex matrices: "real_name_of_output_file.txt", "imag_name_of_output_file.txt"
 //
 //      void read_array_from_file_T(T* pointer_to_matrix, string name_of_input_file)
-//          read an array of type T (C, Z = complex float, double, F, D = float, double) from a text file
+//          read an array of type T (C, Z = complex float, double, S, D = float, double) from a text file
 //              matrices should be in memory in COLUMN MAJOR order (i,j) -> k = dim * j + i
 //              cuBLAS routines use column major order, ugh
 //          for complex data types, reads from text files "real_name_of_input_file.txt" and "imag_name_of_input_file.txt", for real data types reads from "name_of_input_file.txt"
@@ -50,7 +50,7 @@ void write_array_to_file_C(cuFloatComplex* M, std::string M_name, int dim){
 
 }
 
-void write_array_to_file_D(cuDoubleComplex* M, std::string M_name, int dim){
+void write_array_to_file_Z(cuDoubleComplex* M, std::string M_name, int dim){
 
     // file extension and prefixes
     std::string txt = ".txt";
@@ -78,7 +78,7 @@ void write_array_to_file_D(cuDoubleComplex* M, std::string M_name, int dim){
 
 }
 
-void write_array_to_file_F(float* M, std::string M_name, int dim){
+void write_array_to_file_S(float* M, std::string M_name, int dim){
 
     // file extension and prefixes
     std::string txt = ".txt";
@@ -198,7 +198,7 @@ void read_array_from_file_Z(cuDoubleComplex* M, std::string M_name){
     }
 }
 
-void read_array_from_file_F(float* M, std::string M_name){
+void read_array_from_file_S(float* M, std::string M_name){
 
     // file extension and prefixes
     std::string txt = ".txt";

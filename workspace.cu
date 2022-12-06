@@ -60,24 +60,237 @@ cuFloatComplex trace(cuFloatComplex* d_A, int dim, cuHandles x){
     return result;
 }
 
+// MATRIX NORMS
 __global__ void column_sum(cuFloatComplex* d_A, float* normA, int dim){
 
     // one thread gets each column
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // if threads < dim, run it
     if (idx < dim){
 
         float temp = 0;
         for (int i = 0; i < dim; i++){
-            temp = temp + my_cuCabsf(d_A[dim * idx + i]);
+            temp = __fadd_rn(temp, my_cuCabsf(d_A[dim * idx + i]));
         }
         normA[idx] = temp;
     }
 }
 
+__global__ void row_sum(cuFloatComplex* d_A, float* normA, int dim){
+
+    // one thread gets each row
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim){
+
+        float temp = 0;
+        for (int i = 0; i < dim; i++){
+            temp = __fadd_rn(temp, my_cuCabsf(d_A[dim * i + idx]));
+        }
+        normA[idx] = temp;
+    }
+}
+
+__global__ void column_sum_single(cuFloatComplex* d_A, float* normA, int idx, int dim){
+
+    // one thread gets each column
+    int jdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (jdx < 1){
+
+        float temp = 0;
+        for (int i = 0; i < dim; i++){
+            temp = __fadd_rn(temp, my_cuCabsf(d_A[dim * idx + i]));
+        }
+        normA[idx] = temp;
+    }
+}
+
+__global__ void row_sum_single(cuFloatComplex* d_A, float* normA, int idx, int dim){
+
+    // one thread gets each row
+    int jdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (jdx < 1){
+
+        float temp = 0;
+        for (int i = 0; i < dim; i++){
+            temp = __fadd_rn(temp, my_cuCabsf(d_A[dim * i + idx]));
+        }
+        normA[idx] = temp;
+    }
+}
+
+__global__ void balance_matrix_calc_errors(float* cNorms, float* rNorms, float* err, int dim){
+
+    // one thread gets one index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim){
+
+        // assign quotient to error
+        if (cNorms[idx] > rNorms[idx]){
+            err[idx] = __fdiv_rn(cNorms[idx], rNorms[idx]);
+        } else {
+            err[idx] = __fdiv_rn(rNorms[idx], cNorms[idx]);
+        }
+    }
+}
+
+__global__ void balance_matrix_adjust_y(float* y, float* cNorms, float* rNorms, int idx){
+
+    // just give it to a thread
+    int jdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (jdx < 1){    
+        float val = __fmul_rn(0.5, __fsub_rn(logf(cNorms[idx]), logf(rNorms[idx])));
+        y[idx] = __fadd_rn(y[idx], val);
+    }
+}
+
+__global__ void balance_matrix_zero_y(float* y, int dim){
+
+    // one thread = one element of A to adjust
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim){
+        y[idx] = 0.0;
+    }
+}
+
+__global__ void balance_matrix_adjust_A(cuFloatComplex* d_A, cuFloatComplex* tempA, float* y, int dim){
+
+    // one thread = one element of A to adjust
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim * dim){
+
+        // get indices i, j from idx
+        int i = idx % dim;
+        int j = (idx - i) / dim;
+
+        // calculate Dii x invDjj
+        cuFloatComplex val = make_cuFloatComplex(expf(__fsub_rn(y[i], y[j])), 0.0);
+    
+        // adjust Aij
+        tempA[idx] = my_cuCmulf(d_A[idx], val);
+    }
+}
+
+__global__ void balance_matrix_calculate_weights(float* cNorms, float* rNorms, float* difs, int dim){
+
+    // one thread = one comparison
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim){
+        difs[idx] = fabsf(__fsub_rn(sqrtf(rNorms[idx]), sqrtf(cNorms[idx])));
+    }
+}
+
+// RANDOM OSBORNE ALGORITHM FOR MATRIX BALANCING
+void balance_matrix(cuFloatComplex* d_A, float* y, float tol, cuHandles x, int dim){
+
+    // edits matrix A in place (d_A), outputs balancing vector y such that D = diag(exp(y))
+    // repeats until error epsilon for all indicies is less than tol(erance)
+
+    // random seed
+    srand(time(NULL));
+
+    // zero out vector y
+    balance_matrix_zero_y <<< 1 + dim/128, 128 >>> (y, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // memory for a copy of A for iterating
+    cuFloatComplex* tempA; CUDA_CHECK(cudaMalloc(&tempA, dim * dim * sizeof(cuFloatComplex)));
+
+    // memory for column, row norms
+    float* cNorms; CUDA_CHECK(cudaMalloc(&cNorms, dim * sizeof(float)));
+    float* rNorms; CUDA_CHECK(cudaMalloc(&rNorms, dim * sizeof(float)));
+    float* difs;   CUDA_CHECK(cudaMalloc(&difs, dim * sizeof(float)));
+
+    // memory for errors
+    float* err; CUDA_CHECK(cudaMalloc(&err, dim * sizeof(float)));
+
+    // calculate norms
+    column_sum <<< 1 + dim/128, 128 >>> (d_A, cNorms, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+    row_sum <<< 1 + dim/128, 128 >>> (d_A, rNorms, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // calculate errors
+    balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // get the maximal error = epsilon
+    float epsilon = 0.0; int result = 0;
+    CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
+    CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
+
+    // get an initial random index
+    int index = rand() % dim;
+
+    // loop until error is within tolerance
+    int counter = 0;
+    while (epsilon > 1 + tol){
+
+        // if go too long, kill it
+        if (counter > 5000){
+            break;
+        }
+
+        /*
+        // calculate weights of columns, rows for greedy index picking
+        balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, difs, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // get index based on greedy indexing
+        CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, difs, 1, &index));
+        */
+
+        // make the adjustment to y
+        balance_matrix_adjust_y <<< 1, 1 >>> (y, cNorms, rNorms, index); // add a -1 if getting from greedy indexing
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // do the balancing step
+        balance_matrix_adjust_A <<< 1 + (dim * dim)/128, 128 >>> (d_A, tempA, y, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // get index to adjust
+        index = rand() % dim;
+
+        // get new norms for next step (just those for the new index)
+        column_sum_single <<< 1, 1 >>> (tempA, cNorms, index, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        row_sum_single <<< 1, 1 >>> (tempA, rNorms, index, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // check errors every few iterations
+        if (counter % 50 == 0){
+
+            // calculate all norms
+            column_sum <<< 1 + dim/128, 128 >>> (tempA, cNorms, dim);
+            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+            row_sum <<< 1 + dim/128, 128 >>> (tempA, rNorms, dim);
+            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+            // calculate errors
+            balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
+            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+            // get the maximal error = epsilon
+            CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
+            CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
+        }
+
+        // count interations
+        counter = counter + 1;
+    }
+
+    // std::cout << epsilon << std::endl;
+
+    // output for how long to balance
+    // std::cout << "Iterations to balance matrix A = " << counter << std::endl;
+
+    // free memory just in case
+    CUDA_CHECK(cudaFree(cNorms)); CUDA_CHECK(cudaFree(rNorms));
+    CUDA_CHECK(cudaFree(err));    CUDA_CHECK(cudaFree(tempA));
+}
+
 // PREPROCESSING
 cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int* nsquares){
+
+    // edits matrix A in place (d_A), outputs necessary values to undo changes at end of alg
 
     // calculate trace
     cuFloatComplex TrA = trace(d_A, dim, x);
@@ -225,8 +438,7 @@ void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
     CUDA_CHECK(cudaFree(d_ipiv)); CUDA_CHECK(cudaFree(devInfo)); CUDA_CHECK(cudaFree(work));
 }
 
-// PADE APPROXIMANT POLYNOMIALS
-// change this to reduce number of multiplications, see http://eprints.ma.man.ac.uk/634/1/high05e.pdf
+// PADE APPROXIMANT POLYNOMIALS (SERIAL CALCULATION, VARIABLE m)
 void calc_PQ_seq(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 
     // identity and zero values
@@ -328,7 +540,7 @@ void calc_PQ_seq(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, 
     CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y));
 }
 
-// FASTER WAY TO CALCULATE P AND Q-- ONLY 6 MULTIPLICATIONS
+// FASTER WAY TO CALCULATE P AND Q BUT STRICTLY FOR m = 13
 void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 
     // identity and zero values
@@ -433,7 +645,7 @@ void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int 
     // free all allocated cuda memory just in case
     CUDA_CHECK(cudaFree(U1));  CUDA_CHECK(cudaFree(U2));  CUDA_CHECK(cudaFree(V1));  CUDA_CHECK(cudaFree(V2));
     CUDA_CHECK(cudaFree(A2));  CUDA_CHECK(cudaFree(A4));  CUDA_CHECK(cudaFree(A6));
-    CUDA_CHEKC(cudaFree(d_z)); CUDA_CHECK(cudaFree(d_id));
+    CUDA_CHECK(cudaFree(d_z)); CUDA_CHECK(cudaFree(d_id));
 }
 
 int main(){
@@ -477,6 +689,29 @@ int main(){
 
     // create handles
     cuHandles x;
+
+    // memory for balancing
+    float* y; CUDA_CHECK(cudaMalloc(&y, dim * sizeof(float)));
+
+    // balance A
+    balance_matrix(d_A, y, 0.001, x, dim);
+
+    // print time of execution
+    cudaDeviceSynchronize();
+    end = std::chrono::high_resolution_clock::now();
+    duration = end - start;
+    std::cout << "The total elapsed time to balance A was " << duration.count() << "s" << std::endl;
+        
+
+    // copy balancing vector to host
+    float* h_y = new float[dim];
+    CUDA_CHECK(cudaMemcpy(h_y, y, dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // write balancing vector to file
+    std::string y_name = "Y";
+    write_array_to_file_S(h_y, y_name, dim);
+
+    /*
 
     // squaring step
     int* nsquares = new int;
@@ -570,6 +805,7 @@ int main(){
     // print total execution time
     duration = net_end - net_start;
     std::cout << "\nThe total elapsed time to calculate expm(A) not counting preparatory steps was " << duration.count() << "s\n\n";
+    */
 
     // return
     return 0;
@@ -678,7 +914,7 @@ int main(){
 
     // write to files
     std::string d_name = "D"; std::string u_name = "U";
-    write_array_to_file_F(h_D, d_name, DIM);
+    write_array_to_file_S(h_D, d_name, DIM);
     write_array_to_file_C(h_U, u_name, DIM * DIM);
 
     // print the time taken to eigensolve
