@@ -706,7 +706,7 @@ int main(){
     float* y; CUDA_CHECK(cudaMalloc(&y, dim * sizeof(float)));
 
     // tolerance for balancing
-    int tol = 0.01;
+    float tol = 0.05;
 
     // start timing
     start = std::chrono::high_resolution_clock::now();
@@ -743,7 +743,7 @@ int main(){
     std::cout << "\nThe total elapsed time to prepare memory for balancing was " << duration.count() * 1000000 << "us" << std::endl;
 
     // start timing
-    start = std::chrono::high_resolution_clock::now();
+    auto net_start = std::chrono::high_resolution_clock::now();
 
     // calculate norms
     column_sum <<< 1 + dim/128, 128 >>> (d_A, cNorms, dim);
@@ -765,7 +765,7 @@ int main(){
     while (epsilon > 1 + tol){
 
         // if go too long, kill it
-        if (counter > 5000){
+        if (counter > 0){
             break;
         }
 
@@ -780,7 +780,7 @@ int main(){
         cudaDeviceSynchronize();
         end = std::chrono::high_resolution_clock::now();
         duration = end - start;
-        // std::cout << "The total elapsed time to calculate difs was " << duration.count() * 1000000 << "us" << std::endl;        
+        std::cout << "The total elapsed time to calculate difs was " << duration.count() * 1000000 << "us" << std::endl;        
 
         // start timing
         start = std::chrono::high_resolution_clock::now();
@@ -792,7 +792,7 @@ int main(){
         cudaDeviceSynchronize();
         end = std::chrono::high_resolution_clock::now();
         duration = end - start;
-        // std::cout << "The total elapsed time to pick the greedy index was " << duration.count() * 1000000 << "us" << std::endl;        
+        std::cout << "The total elapsed time to pick the greedy index was " << duration.count() * 1000000 << "us" << std::endl;        
 
         // start timing
         start = std::chrono::high_resolution_clock::now();        
@@ -805,7 +805,7 @@ int main(){
         cudaDeviceSynchronize();
         end = std::chrono::high_resolution_clock::now();
         duration = end - start;
-        // std::cout << "The total elapsed time to calculate the new balancing vector was " << duration.count() * 1000000 << "us" << std::endl;                
+        std::cout << "The total elapsed time to calculate the new balancing vector was " << duration.count() * 1000000 << "us" << std::endl;                
 
         // start timing
         start = std::chrono::high_resolution_clock::now();        
@@ -818,7 +818,7 @@ int main(){
         cudaDeviceSynchronize();
         end = std::chrono::high_resolution_clock::now();
         duration = end - start;
-        // std::cout << "The total elapsed time to balance the matrix was " << duration.count() * 1000000 << "us" << std::endl;                
+        std::cout << "The total elapsed time to balance the matrix was " << duration.count() * 1000000 << "us" << std::endl;                
 
         // start timing
         start = std::chrono::high_resolution_clock::now();        
@@ -835,7 +835,7 @@ int main(){
         cudaDeviceSynchronize();
         end = std::chrono::high_resolution_clock::now();
         duration = end - start;
-        // std::cout << "The total elapsed time to adjust individual column, row sums was " << duration.count() * 1000000 << "us" << std::endl;                
+        std::cout << "The total elapsed time to adjust individual column, row sums was " << duration.count() * 1000000 << "us" << std::endl;                
 
         // check errors every few iterations
         if (counter % 25 == 0){
@@ -853,7 +853,7 @@ int main(){
             cudaDeviceSynchronize();
             end = std::chrono::high_resolution_clock::now();
             duration = end - start;
-            // std::cout << "The total elapsed time to recalculate all norms was " << duration.count() * 1000000 << "us" << std::endl;                    
+            std::cout << "The total elapsed time to recalculate all norms was " << duration.count() * 1000000 << "us" << std::endl;                    
 
             // start timing
             start = std::chrono::high_resolution_clock::now();            
@@ -866,7 +866,7 @@ int main(){
             cudaDeviceSynchronize();
             end = std::chrono::high_resolution_clock::now();
             duration = end - start;
-            // std::cout << "The total elapsed time to calculate errors was " << duration.count() * 1000000 << "us" << std::endl;                   
+            std::cout << "The total elapsed time to calculate errors was " << duration.count() * 1000000 << "us" << std::endl;                   
 
             // start timing
             start = std::chrono::high_resolution_clock::now();            
@@ -879,7 +879,7 @@ int main(){
             cudaDeviceSynchronize();
             end = std::chrono::high_resolution_clock::now();
             duration = end - start;
-            // std::cout << "The total elapsed time to calculate epsilon was " << duration.count() * 1000000 << "us" << std::endl << std::endl;                   
+            std::cout << "The total elapsed time to calculate epsilon was " << duration.count() * 1000000 << "us" << std::endl << std::endl;
 
         }
 
@@ -892,9 +892,9 @@ int main(){
 
     // print time of execution
     cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to balance A was " << duration.count() * 1000000 << "us" << std::endl;
+    auto net_end = std::chrono::high_resolution_clock::now();
+    duration = net_end - net_start;
+    std::cout << "The total elapsed time to balance A was " << duration.count() << "s" << std::endl;
 
     // copy balancing vector to host
     float* h_y = new float[dim];
