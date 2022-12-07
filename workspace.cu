@@ -117,6 +117,17 @@ __global__ void row_sum_single(cuFloatComplex* d_A, float* normA, int idx, int d
     }
 }
 
+// get the absolute values of a single row
+__global__ void balance_matrix_prep_norms(cuFloatComplex* d_A, float* absRow, float* absCol, int idx, int dim){
+
+    // one thread gets each row
+    int jdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (jdx < dim){
+        absRow[jdx] = my_cuCabsf(d_A[dim * jdx + idx]);
+        absCol[jdx] = my_cuCabsf(d_A[dim * idx + jdx]);
+    }
+}
+
 __global__ void balance_matrix_calc_errors(float* cNorms, float* rNorms, float* err, int dim){
 
     // one thread gets one index
@@ -250,10 +261,11 @@ void balance_matrix(cuFloatComplex* d_A, float* y, float tol, cuHandles x, int d
         index = rand() % dim;
 
         // get new norms for next step (just those for the new index)
-        column_sum_single <<< 1, 1 >>> (tempA, cNorms, index, dim);
+        /* balance_matrix_abs_col <<< 1 + dim/128, 128 >>> (tempA, cNorms, index, dim);
         CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-        row_sum_single <<< 1, 1 >>> (tempA, rNorms, index, dim);
+        balance_matrix_abs_row <<< 1 + dim/128, 128 >>> (tempA, rNorms, index, dim);
         CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        */
 
         // check errors every few iterations
         if (counter % 50 == 0){
@@ -693,15 +705,196 @@ int main(){
     // memory for balancing
     float* y; CUDA_CHECK(cudaMalloc(&y, dim * sizeof(float)));
 
-    // balance A
-    balance_matrix(d_A, y, 0.001, x, dim);
+    // tolerance for balancing
+    int tol = 0.01;
+
+    // start timing
+    start = std::chrono::high_resolution_clock::now();
+
+    // random seed
+    srand(time(NULL));
+
+    // zero out vector y
+    balance_matrix_zero_y <<< 1 + dim/128, 128 >>> (y, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // memory for a copy of A for iterating
+    cuFloatComplex* tempA; CUDA_CHECK(cudaMalloc(&tempA, dim * dim * sizeof(cuFloatComplex)));
+
+    // memory for column, row norms
+    float* cNorms; CUDA_CHECK(cudaMalloc(&cNorms, dim * sizeof(float)));
+    float* rNorms; CUDA_CHECK(cudaMalloc(&rNorms, dim * sizeof(float)));
+    float* absCol; CUDA_CHECK(cudaMalloc(&absCol, dim * sizeof(float)));
+    float* absRow; CUDA_CHECK(cudaMalloc(&absRow, dim * sizeof(float)));
+    float* difs;   CUDA_CHECK(cudaMalloc(&difs, dim * sizeof(float)));
+
+    // memory for errors
+    float* err; CUDA_CHECK(cudaMalloc(&err, dim * sizeof(float)));
+
+    // for trace trick
+    float h_one = 1;
+    float* one; CUDA_CHECK(cudaMalloc(&one, sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(one, &h_one, sizeof(float), cudaMemcpyHostToDevice));
 
     // print time of execution
     cudaDeviceSynchronize();
     end = std::chrono::high_resolution_clock::now();
     duration = end - start;
-    std::cout << "The total elapsed time to balance A was " << duration.count() << "s" << std::endl;
-        
+    std::cout << "\nThe total elapsed time to prepare memory for balancing was " << duration.count() * 1000000 << "us" << std::endl;
+
+    // start timing
+    start = std::chrono::high_resolution_clock::now();
+
+    // calculate norms
+    column_sum <<< 1 + dim/128, 128 >>> (d_A, cNorms, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+    row_sum <<< 1 + dim/128, 128 >>> (d_A, rNorms, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // calculate errors
+    balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // get the maximal error = epsilon
+    float epsilon = 0.0; int result = 0;
+    CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
+    CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
+
+    // loop until error is within tolerance
+    int counter = 0; int index;
+    while (epsilon > 1 + tol){
+
+        // if go too long, kill it
+        if (counter > 5000){
+            break;
+        }
+
+        // start timing
+        start = std::chrono::high_resolution_clock::now();
+
+        // calculate weights of columns, rows for greedy index picking
+        balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, difs, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // print time of execution
+        cudaDeviceSynchronize();
+        end = std::chrono::high_resolution_clock::now();
+        duration = end - start;
+        // std::cout << "The total elapsed time to calculate difs was " << duration.count() * 1000000 << "us" << std::endl;        
+
+        // start timing
+        start = std::chrono::high_resolution_clock::now();
+
+        // get index based on greedy indexing
+        CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, difs, 1, &index));
+
+        // print time of execution
+        cudaDeviceSynchronize();
+        end = std::chrono::high_resolution_clock::now();
+        duration = end - start;
+        // std::cout << "The total elapsed time to pick the greedy index was " << duration.count() * 1000000 << "us" << std::endl;        
+
+        // start timing
+        start = std::chrono::high_resolution_clock::now();        
+
+        // make the adjustment to y
+        balance_matrix_adjust_y <<< 1, 1 >>> (y, cNorms, rNorms, index - 1); // add a -1 if getting from greedy indexing
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // print time of execution
+        cudaDeviceSynchronize();
+        end = std::chrono::high_resolution_clock::now();
+        duration = end - start;
+        // std::cout << "The total elapsed time to calculate the new balancing vector was " << duration.count() * 1000000 << "us" << std::endl;                
+
+        // start timing
+        start = std::chrono::high_resolution_clock::now();        
+
+        // do the balancing step
+        balance_matrix_adjust_A <<< 1 + (dim * dim)/128, 128 >>> (d_A, tempA, y, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // print time of execution
+        cudaDeviceSynchronize();
+        end = std::chrono::high_resolution_clock::now();
+        duration = end - start;
+        // std::cout << "The total elapsed time to balance the matrix was " << duration.count() * 1000000 << "us" << std::endl;                
+
+        // start timing
+        start = std::chrono::high_resolution_clock::now();        
+
+        // get new norms for next step (just those for the new index)
+        balance_matrix_prep_norms <<< 1 + dim/128, 128 >>> (tempA, absRow, absCol, index - 1, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // crunch it
+        CUBLAS_CHECK(cublasSdot(x.cublasH, dim, absRow, 1, one, 0, &rNorms[index - 1]));
+        CUBLAS_CHECK(cublasSdot(x.cublasH, dim, absCol, 1, one, 0, &cNorms[index - 1]));
+
+        // print time of execution
+        cudaDeviceSynchronize();
+        end = std::chrono::high_resolution_clock::now();
+        duration = end - start;
+        // std::cout << "The total elapsed time to adjust individual column, row sums was " << duration.count() * 1000000 << "us" << std::endl;                
+
+        // check errors every few iterations
+        if (counter % 25 == 0){
+
+            // start timing
+            start = std::chrono::high_resolution_clock::now();
+
+            // calculate all norms
+            column_sum <<< 1 + dim/128, 128 >>> (tempA, cNorms, dim);
+            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+            row_sum <<< 1 + dim/128, 128 >>> (tempA, rNorms, dim);
+            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+            // print time of execution
+            cudaDeviceSynchronize();
+            end = std::chrono::high_resolution_clock::now();
+            duration = end - start;
+            // std::cout << "The total elapsed time to recalculate all norms was " << duration.count() * 1000000 << "us" << std::endl;                    
+
+            // start timing
+            start = std::chrono::high_resolution_clock::now();            
+
+            // calculate errors
+            balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
+            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+            // print time of execution
+            cudaDeviceSynchronize();
+            end = std::chrono::high_resolution_clock::now();
+            duration = end - start;
+            // std::cout << "The total elapsed time to calculate errors was " << duration.count() * 1000000 << "us" << std::endl;                   
+
+            // start timing
+            start = std::chrono::high_resolution_clock::now();            
+
+            // get the maximal error = epsilon
+            CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
+            CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
+
+            // print time of execution
+            cudaDeviceSynchronize();
+            end = std::chrono::high_resolution_clock::now();
+            duration = end - start;
+            // std::cout << "The total elapsed time to calculate epsilon was " << duration.count() * 1000000 << "us" << std::endl << std::endl;                   
+
+        }
+
+        // count interations
+        counter = counter + 1;
+    }
+
+    // print balancing iterations
+    std::cout << "The number of iterations to balance was " << counter << std::endl;
+
+    // print time of execution
+    cudaDeviceSynchronize();
+    end = std::chrono::high_resolution_clock::now();
+    duration = end - start;
+    std::cout << "The total elapsed time to balance A was " << duration.count() * 1000000 << "us" << std::endl;
 
     // copy balancing vector to host
     float* h_y = new float[dim];
