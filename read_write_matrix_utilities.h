@@ -1,7 +1,7 @@
 /* UTILITIES FOR WRITING, READING MATRICES FROM TEXT FILES */
 //
 //      void write_array_to_file_T(T* matrix_to_write, string name_of_output_file, int number_of_elements)
-//          write an array of type T (C, Z = complex float, double, S, D = float, double) to a text file
+//          write an array of type T (C, Z = complex float, double, S, D = float, double, I = integer) to a text file
 //              matrices should be in memory in COLUMN MAJOR order (i,j) -> k = dim * j + i
 //              cuBLAS routines use column major order, ugh
 //          text file name = "name_of_output_file.txt" if real valued matrix
@@ -102,6 +102,29 @@ void write_array_to_file_S(float* M, std::string M_name, int dim){
 }
 
 void write_array_to_file_D(double* M, std::string M_name, int dim){
+
+    // file extension and prefixes
+    std::string txt = ".txt";
+
+    // make the real and imaginary file names
+    std::string name = M_name + txt;
+
+    // convert to type for ofstream
+    const char* output_name = name.c_str();
+
+    // open the files
+    std::ofstream output;
+    output.open(output_name);
+
+    // write to the files
+    for (int i = 0; i < dim; i++)
+    {
+        output << M[i] << "\n";
+    }
+
+}
+
+void write_array_to_file_I(int* M, std::string M_name, int dim){
 
     // file extension and prefixes
     std::string txt = ".txt";

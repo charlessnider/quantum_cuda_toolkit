@@ -110,7 +110,7 @@ __global__ void balance_matrix_adjust_y(float* y, float* cNorms, float* rNorms, 
     // just give it to a thread
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size){    
-        int jdx = update_list[idx] - 1;
+        int jdx = update_list[idx];
         float val = __fmul_rn(0.5, __fsub_rn(logf(cNorms[jdx]), logf(rNorms[jdx])));
         y[jdx] = __fadd_rn(y[jdx], val);
     }
@@ -150,6 +150,64 @@ __global__ void balance_matrix_calculate_weights(float* cNorms, float* rNorms, f
     if (idx < dim){
         weights[idx] = fabsf(__fsub_rn(sqrtf(rNorms[idx]), sqrtf(cNorms[idx])));
     }
+}
+
+// SORTING ALGORITHM: adapted from https://www.geeksforgeeks.org/cpp-program-for-quicksort/
+int partition(float* vals, int* I, int start, int end){
+
+    // I = array of indices, vals = array of values
+
+    // find the correct position for pivot value by finding how many values are greater than or equal to pivot
+    float pivot = vals[start];
+    int di = 0;
+    for (int i = start + 1; i <= end; i++){
+        if (vals[i] >= pivot){
+            di++;
+        }
+    }
+
+    // move pivot to correct location
+    int pivot_idx = start + di;
+    std::swap(vals[pivot_idx], vals[start]);
+    std::swap(I[pivot_idx], I[start]);
+
+    // move all values greater than pivot to right of pivot, and all values less to the left
+    int L = start, R = end;
+    while (L < pivot_idx && R > pivot_idx){
+
+        // increase L until find an element > pivot
+        while (vals[L] >= pivot){
+            L++;
+        }
+
+        // decrease R until find an element < pivot
+        while(vals[R] < pivot){
+            R--;
+        }
+
+        // if R, L stil on correct side of pivot, swap
+        if (L < pivot_idx && R > pivot_idx){     
+            std::swap(vals[L], vals[R]);
+            std::swap(I[L], I[R]);
+            L++; R--;
+        }        
+    }
+    return pivot_idx;
+}
+
+void quick_sort(float* vals, int* I, int start, int end){
+
+    // kill if start is to right of end/no more sorting to do
+    if (start >= end){
+        return;
+    }
+
+    // sort around the pivot
+    int p = partition(vals, I, start, end);
+
+    // recursively do left and right parts
+    quick_sort(vals, I, start, p - 1);
+    quick_sort(vals, I, p + 1, end);
 }
 
 // PREPROCESSING
@@ -571,14 +629,22 @@ int main(){
     // memory for column, row norms
     float* cNorms;  CUDA_CHECK(cudaMalloc(&cNorms, dim * sizeof(float)));
     float* rNorms;  CUDA_CHECK(cudaMalloc(&rNorms, dim * sizeof(float)));
-    float* weights; CUDA_CHECK(cudaMalloc(&weights, dim * sizeof(float)));
+
+    // memory for greedy indexing
+    float* d_weights; CUDA_CHECK(cudaMalloc(&d_weights, dim * sizeof(float)));
+    float* h_weights = new float[dim];
     
     // counter and batch information for iterating
-    int counter = 0, batch_size = 25, batch_idx = 0;
+    int counter = 0, batch_size = 300;
 
     // memory for finding indices to adjust in each interation
-    int* h_update = new int[batch_size];
+    int* h_update = new int[dim];
     int* d_update;  CUDA_CHECK(cudaMalloc(&d_update, batch_size * sizeof(int)));
+    
+    // index array for sorting
+    int* idx_list = new int[dim];
+    for (int i = 0; i < dim; i++) idx_list[i] = i;
+    memcpy(h_update, idx_list, dim * sizeof(int));
 
     // memory for errors
     float* err; CUDA_CHECK(cudaMalloc(&err, dim * sizeof(float)));
@@ -593,8 +659,11 @@ int main(){
     CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
 
     // calculate weights of columns, rows for greedy index picking
-    balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, weights, dim);
+    balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_weights, dim);
     CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // copy weights to host
+    CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
 
     // calculate errors
     balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
@@ -606,62 +675,57 @@ int main(){
     CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
     
     // tolerance for balancing & value zero for weights
-    float tol = 0.05, zero = 0.0;
+    float tol = 0.01;
 
     // loop until within tolerance, or hit 5,000 iterations
     while (epsilon > 1 + tol){
 
         // if go too long, kill it
         if (counter > 5000){
-            std::cout << "Unable to balance within 5,000 iterations.  Ending balancing and outputting most recent balancing parameters." << std::endl;
+            std::cout << "Unable to balance within 5,000 iterations. Ending balancing and outputting most recent balancing parameters." << std::endl;
             break;
         }
 
-        // get index based on greedy indexing
-        CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, weights, 1, h_update + batch_idx));
+        // sort the weights to get worst matches
+        quick_sort(h_weights, h_update, 0, dim - 1);   
 
-        // zero out the greedy indexing of the row we changed
-        CUDA_CHECK(cudaMemcpy(weights + h_update[batch_idx] - 1, &zero, sizeof(float), cudaMemcpyHostToDevice));           
-        
-        // count interations
-        counter = counter + 1;
-        batch_idx = batch_idx + 1;
+        // copy worst indices for update list to device
+        CUDA_CHECK(cudaMemcpy(d_update, h_update, batch_size * sizeof(int), cudaMemcpyHostToDevice));
 
-        // check errors every few iterations
-        if (batch_idx == batch_size){
+        // make the adjustment to y
+        balance_matrix_adjust_y <<< 1 + batch_size/128, 128 >>> (y, cNorms, rNorms, d_update, batch_size); // add a -1 if getting direct from greedy indexing
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
 
-            // zero out batch_idx
-            batch_idx = 0;
+        // do the balancing step
+        balance_matrix_adjust_A <<< 1 + (dim * dim)/128, 128 >>> (d_A, tempA, y, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());     
 
-            // copy update list to device
-            CUDA_CHECK(cudaMemcpy(d_update, h_update, batch_size * sizeof(int), cudaMemcpyHostToDevice));
+        // calculate all norms
+        column_sum <<< 1 + dim/128, 128 >>> (tempA, cNorms, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        row_sum <<< 1 + dim/128, 128 >>> (tempA, rNorms, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());   
 
-            // make the adjustment to y
-            balance_matrix_adjust_y <<< 1 + batch_size/128, 128 >>> (y, cNorms, rNorms, d_update, batch_size); // add a -1 if getting direct from greedy indexing
-            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        // calculate errors
+        balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
 
-            // do the balancing step
-            balance_matrix_adjust_A <<< 1 + (dim * dim)/128, 128 >>> (d_A, tempA, y, dim);
-            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());     
+        // get the maximal error = epsilon
+        CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
+        CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
 
-            // calculate all norms
-            column_sum <<< 1 + dim/128, 128 >>> (tempA, cNorms, dim);
-            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-            row_sum <<< 1 + dim/128, 128 >>> (tempA, rNorms, dim);
-            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());   
+        // calculate new weights for greedy index picking
+        balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_weights, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
 
-            // calculate errors
-            balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
-            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        // copy weights to host
+        CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
 
-            // get the maximal error = epsilon
-            CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
-            CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
+        // reset update array for next sort
+        memcpy(h_update, idx_list, dim * sizeof(int));
 
-            // calculate new weights for greedy index picking
-            balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, weights, dim);
-            CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-        }
+        // update counter
+        counter = counter + batch_size;
     }
 
     // print balancing iterations
