@@ -195,6 +195,92 @@ int partition(float* vals, int* I, int start, int end){
     return pivot_idx;
 }
 
+// GPU REDUCTION TO GET PIVOT POSITION: https://cuvilib.com/Reduction.pdf
+__global__ void gpu_sum_int128(int* input, int* output, int dim){
+
+    // shared memory for the thread block for a chunk of A
+    __shared__ int data[128];
+
+    // indexing: thread index in block as well as overall index for all threads/blocks
+    unsigned int t_idx = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // only launch if in the right range
+    if (idx < dim){
+
+        // move a chunk of A into shared memory
+        data[t_idx] = input[idx];
+        __syncthreads();
+
+        // s = spacing between sites: first iteration, compare neighbors, then compare 2 over, then 4 over, etc
+        for(unsigned int s = 1; s < blockDim.x; s *= 2){
+            
+            // only make the comparison if on a "zero" thread, ie one to replace with
+            if (t_idx % (2 * s) == 0){
+
+                // add the values
+                data[t_idx] = data[t_idx] + data[t_idx + s];
+
+                // synchronize threads before continuing
+                __syncthreads();
+            }
+        }
+
+        // when reach the end, output the very final result
+        if (t_idx == 0){
+            output[blockIdx.x] = data[0];
+        }
+    }
+}
+
+// GET THE PIVOT SHIFT FOR QUICK SORT IN ONE KERNEL
+__global__ void gpu_pivot_shift128(float* finput, int* input, int* output, float* pivot, int itr, int start, int end){
+
+    // shared memory for the thread block for a chunk of A
+    __shared__ int data[128];
+
+    // indexing: thread index in block as well as overall index for all threads/blocks
+    unsigned int t_idx = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // only launch if within bounds of array
+    if (idx < (end - start)){
+
+        // if first iteration, assign directly
+        int arr_idx = start + idx + 1; // index of subarray
+        if (itr == 0){
+            if (finput[arr_idx] >= *pivot){
+                data[t_idx] = 1;
+            } else {
+                data[t_idx] = 0;
+            }
+        } else { // otherwise load from idx_input = output of previous iteration
+            data[t_idx] = input[idx];
+        }
+        __syncthreads();
+
+        // do a basic reduction
+        for(unsigned int s = 1; s < blockDim.x; s *= 2){
+            
+            // only make the comparison if on a "zero" thread, ie one to replace with
+            if (t_idx % (2 * s) == 0){
+
+                // add the values
+                data[t_idx] = data[t_idx] + data[t_idx + s];
+
+                // synchronize threads before continuing
+                __syncthreads();
+            }
+        }
+
+        // when reach the end, save the result of each block to output
+        if (t_idx == 0){
+            output[blockIdx.x] = data[0];
+        }
+    }
+}
+
+
 void quick_sort(float* vals, int* I, int start, int end){
 
     // kill if start is to right of end/no more sorting to do
@@ -634,8 +720,8 @@ int main(){
     float* d_weights; CUDA_CHECK(cudaMalloc(&d_weights, dim * sizeof(float)));
     float* h_weights = new float[dim];
     
-    // counter and batch information for iterating
-    int counter = 0, batch_size = 300;
+    // counter and batch information for iterating (batch = 20% of matrix at a time)
+    int counter = 0, batch_size = dim / 5;
 
     // memory for finding indices to adjust in each interation
     int* h_update = new int[dim];
@@ -676,6 +762,53 @@ int main(){
     
     // tolerance for balancing & value zero for weights
     float tol = 0.01;
+
+    // seed
+    srand(time(0));
+
+    // start and end values
+    int st = rand() % 500;
+    int ed = 501 + rand() % 500; // dim - 1;
+    int pv_idx = 0;
+
+    std::cout << std::endl << "Start: " << st << ", End: " << ed << std::endl;
+    std::cout << "Number of sums: " << 1 + (ed - st)/128 << std::endl << std::endl;
+
+    // cpu sort
+    float pivot = h_weights[pv_idx];
+    int* cpu_pv_res = new int[dim/128];
+
+    int di = 0;
+    for (int i = 0; i < (ed - st)/128; i++){
+        for (int j = st + 128 * i; j <= st + 128 * (i + 1); j++){
+            if (h_weights[j] >= pivot){
+                di++;
+            }
+        }
+        cpu_pv_res[i] = di;
+        di = 0;
+    }
+    int rnded = (ed - st)/128;
+    for (int i = 0; i < (ed - st) % 128; i++){
+        if (h_weights[st + 128 * rnded + i] >= pivot){
+            di++;
+        }
+    }
+    cpu_pv_res[rnded] = di;
+
+    // gpu version
+    int* pv_find_input; CUDA_CHECK(cudaMalloc(&pv_find_input, dim * sizeof(int)));
+    int* pv_find_output; CUDA_CHECK(cudaMalloc(&pv_find_output, (dim / 128) * sizeof(int)));
+    gpu_pivot_shift128 <<< 1 + dim/128, 128 >>> (d_weights, pv_find_input, pv_find_output, d_weights + pv_idx, 0, st, ed);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());  
+    
+    int* pv_res = new int[dim/128];
+    CUDA_CHECK(cudaMemcpy(pv_res, pv_find_output, (1 + (ed - st) / 128) * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 1 + (ed - st)/128; i++){
+        std::cout << pv_res[i] << " " << cpu_pv_res[i] << std::endl;
+    }
+
+    /*
 
     // loop until within tolerance, or hit 5,000 iterations
     while (epsilon > 1 + tol){
@@ -744,6 +877,7 @@ int main(){
     // write balancing vector to file
     std::string y_name = "Y";
     write_array_to_file_S(h_y, y_name, dim);
+    */
 
     /*
 
