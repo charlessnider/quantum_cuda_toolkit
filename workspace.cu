@@ -172,7 +172,7 @@ int partition(float* vals, int* I, int start, int end){
     std::swap(I[pivot_idx], I[start]);
 
     // move all values greater than pivot to right of pivot, and all values less to the left
-    int L = start, R = end;
+    int L = start, R = end, num = 0;;
     while (L < pivot_idx && R > pivot_idx){
 
         // increase L until find an element > pivot
@@ -189,13 +189,14 @@ int partition(float* vals, int* I, int start, int end){
         if (L < pivot_idx && R > pivot_idx){     
             std::swap(vals[L], vals[R]);
             std::swap(I[L], I[R]);
-            L++; R--;
+            L++; R--; num++;
         }        
     }
+    std::cout << "Host number of swaps = " << num << std::endl;
     return pivot_idx;
 }
 
-// GPU REDUCTION TO GET PIVOT POSITION: https://cuvilib.com/Reduction.pdf
+// GPU INT REDUCTION: https://cuvilib.com/Reduction.pdf
 __global__ void gpu_sum_int128(int* input, int* output, int dim){
 
     // shared memory for the thread block for a chunk of A
@@ -244,7 +245,7 @@ __global__ void gpu_pivot_shift128(float* finput, int* input, int* output, float
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // only launch if within bounds of array
-    if (idx < (end - start)){
+    if (idx < (end - start + 1)){
 
         // if first iteration, assign directly
         int arr_idx = start + idx + 1; // index of subarray
@@ -280,6 +281,71 @@ __global__ void gpu_pivot_shift128(float* finput, int* input, int* output, float
     }
 }
 
+// to swap floats, ints
+__device__ void gpu_swap_float(float* a, float* b){
+    float temp = *a;
+    *a = *b;
+    *b = temp;
+}
+
+__device__ void gpu_swap_int(int* a, int* b){
+    int temp = *a;
+    *a = *b;
+    *b = temp;
+}
+
+// temp function
+__global__ void gpu_swap(float*a, float* b){
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == 0){
+        float temp = *a;
+        *a = *b;
+        *b = temp;
+    }
+}
+
+// SWAPPING INDICES
+__global__ void gpu_make_swaps(float* input, int pivot_idx, 
+                               int* swapL, int* swapR, int* updateL, int* updateR,
+                               int start, int end){
+
+    // pass each value for comparison to one thread
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    /* / zero out swapL, swapR
+    if (idx < (end - start)){
+        swapL[idx] = 0;
+        swapR[idx] = 0;
+    }
+    __syncthreads();
+    */
+
+    // find the elements to swap
+    if (idx < (end - start + 1)){
+        if (idx < pivot_idx && input[start + idx] < input[pivot_idx]){
+            int t_idx = atomicAdd(updateL, 1);
+            swapL[t_idx] = idx;
+        } 
+        if (idx > pivot_idx && input[start + idx] >= input[pivot_idx]){
+            int t_idx = atomicAdd(updateR, 1);
+            swapR[t_idx] = idx;
+        } 
+    }
+    __syncthreads();
+
+    // make the appropriate swaps: will have *updateL swaps to make
+    if (idx < *updateL){
+        gpu_swap_float(&input[start + swapL[idx]], &input[start + swapR[idx]]);
+    }
+}
+
+__global__ void at_add_test(int* val, int* val_ar, int num){
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num){
+        int temp = atomicAdd(val, 1);
+        val_ar[temp] = idx;
+    }
+}
 
 void quick_sort(float* vals, int* I, int start, int end){
 
@@ -747,7 +813,7 @@ int main(){
     // calculate weights of columns, rows for greedy index picking
     balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_weights, dim);
     CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-    
+
     // copy weights to host
     CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -759,54 +825,112 @@ int main(){
     float epsilon = 0.0; int result = 0;
     CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
     CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
-    
+
     // tolerance for balancing & value zero for weights
     float tol = 0.01;
 
-    // seed
+    // randomize h_weights
     srand(time(0));
+    for (int i = 0; i < dim; i++) h_weights[i] = (float) (rand() % 10000) / 100.0;
+    CUDA_CHECK(cudaMemcpy(d_weights, h_weights, dim * sizeof(float), cudaMemcpyHostToDevice));
 
     // start and end values
-    int st = rand() % 500;
-    int ed = 501 + rand() % 500; // dim - 1;
-    int pv_idx = 0;
-
-    std::cout << std::endl << "Start: " << st << ", End: " << ed << std::endl;
-    std::cout << "Number of sums: " << 1 + (ed - st)/128 << std::endl << std::endl;
-
-    // cpu sort
-    float pivot = h_weights[pv_idx];
-    int* cpu_pv_res = new int[dim/128];
-
-    int di = 0;
-    for (int i = 0; i < (ed - st)/128; i++){
-        for (int j = st + 128 * i; j <= st + 128 * (i + 1); j++){
-            if (h_weights[j] >= pivot){
-                di++;
-            }
-        }
-        cpu_pv_res[i] = di;
-        di = 0;
-    }
-    int rnded = (ed - st)/128;
-    for (int i = 0; i < (ed - st) % 128; i++){
-        if (h_weights[st + 128 * rnded + i] >= pivot){
-            di++;
-        }
-    }
-    cpu_pv_res[rnded] = di;
-
-    // gpu version
     int* pv_find_input; CUDA_CHECK(cudaMalloc(&pv_find_input, dim * sizeof(int)));
     int* pv_find_output; CUDA_CHECK(cudaMalloc(&pv_find_output, (dim / 128) * sizeof(int)));
-    gpu_pivot_shift128 <<< 1 + dim/128, 128 >>> (d_weights, pv_find_input, pv_find_output, d_weights + pv_idx, 0, st, ed);
+
+    // adjustable dim
+    int t_dim = dim / 128, itr = 0, st = 0, ed = dim - 1;
+
+    // first pass
+    gpu_pivot_shift128 <<< 1 + dim/128, 128 >>> (d_weights, pv_find_input, pv_find_output, d_weights + st, itr, st, ed);
     CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());  
-    
-    int* pv_res = new int[dim/128];
-    CUDA_CHECK(cudaMemcpy(pv_res, pv_find_output, (1 + (ed - st) / 128) * sizeof(int), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < 1 + (ed - st)/128; i++){
-        std::cout << pv_res[i] << " " << cpu_pv_res[i] << std::endl;
+
+    // increment iteration
+    itr++;
+
+    // recursively if still too many for one block
+    while (t_dim / 128 > 0){
+        
+        // first pass
+        gpu_pivot_shift128 <<< 1 + dim/128, 128 >>> (d_weights, pv_find_output, pv_find_output, d_weights + st, itr, st, ed);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());  
+
+        // reduce t_dim
+        t_dim = t_dim / 128;
+        
+        // increment iteration
+        itr++;
     }
+
+    // run once more
+    gpu_pivot_shift128 <<< 1 + dim/128, 128 >>> (d_weights, pv_find_output, pv_find_output, d_weights + st, itr + 1, st, ed);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());  
+
+
+    // copy over final result
+    int res;
+    CUDA_CHECK(cudaMemcpy(&res, pv_find_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // do the swap (temporary here)
+    gpu_swap <<< 1, 1 >>> (d_weights, d_weights + res);
+
+    // display
+    std::cout << "Device pivot index = " << res << std::endl;
+    float blah;
+    CUDA_CHECK(cudaMemcpy(&blah, d_weights + res, sizeof(float), cudaMemcpyDeviceToHost));
+    std::cout << "Device pivot value = " << blah << std::endl;
+
+    // on cpu
+    int p = partition(h_weights, h_update, st, ed);
+    std::cout << "Host pivot index = " << p << std::endl;
+    std::cout << "Host pivot value = " << h_weights[p] << std::endl;
+
+    // memory for swaps
+    int* swapL; CUDA_CHECK(cudaMalloc(&swapL, dim * sizeof(int)));
+    int* swapR; CUDA_CHECK(cudaMalloc(&swapR, dim * sizeof(int)));
+    int* updateL; CUDA_CHECK(cudaMalloc(&updateL, sizeof(int)));
+    int* updateR; CUDA_CHECK(cudaMalloc(&updateR, sizeof(int)));
+    int z = 0;
+    CUDA_CHECK(cudaMemcpy(updateL, &z, sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(updateR, &z, sizeof(int), cudaMemcpyHostToDevice));
+
+    // run it, see if it bricks
+    gpu_make_swaps <<< 1 + dim/128, 128 >>> (d_weights, res, swapL, swapR, updateL, updateR, st, ed);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(&z, updateL, sizeof(int), cudaMemcpyDeviceToHost));
+    std::cout << "updateL = " << z << std::endl;
+
+    CUDA_CHECK(cudaMemcpy(&z, updateR, sizeof(int), cudaMemcpyDeviceToHost));
+    std::cout << "updateR = " << z << std::endl;
+
+    // save h to file
+    std::string h_name = "host";
+    write_array_to_file_S(h_weights, h_name, dim);
+
+    // write d to file
+    std::string d_name = "device";
+    CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
+    write_array_to_file_S(h_weights, d_name, dim);
+
+    /*/ test atomic add
+    z = 0;
+    int t_num = 10;
+    int* val_arr; CUDA_CHECK(cudaMalloc(&val_arr, t_num * sizeof(int)));
+    int* vals; CUDA_CHECK(cudaMalloc(&vals, sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(vals, &z, sizeof(int), cudaMemcpyHostToDevice));
+
+    at_add_test <<< 1 + t_num/128, 128 >>> (vals, val_arr, t_num);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    int* h_arr = new int[t_num];
+    int h_val;
+    CUDA_CHECK(cudaMemcpy(h_arr, val_arr, t_num * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_val, vals, sizeof(int), cudaMemcpyDeviceToHost));
+
+    std::cout << std::endl << h_val << std::endl << std::endl;
+    for (int i = 0; i < t_num; i++) std::cout << h_arr[i] << std::endl;
+    */
 
     /*
 
