@@ -255,7 +255,7 @@ __global__ void gpu_pivot_shift128(float* finput, int* input, int* output, float
             } else {
                 data[t_idx] = 0;
             }
-        } else { // otherwise load from idx_input = output of previous iteration
+        } else { // otherwise load from input = output of previous iteration
             data[t_idx] = input[idx];
         }
         __syncthreads();
@@ -281,6 +281,79 @@ __global__ void gpu_pivot_shift128(float* finput, int* input, int* output, float
     }
 }
 
+__global__ void gpu_compare_pivot128(float* vals, int* output, int start, int end){
+
+    // keep it simple: have each thread make a comparison
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // first element is the pivot
+    float pivot = vals[start];
+
+    // if value is greater, need to shift one over
+    output[idx] = 0;
+    
+    // only make the comparison if within range
+    if (idx < (end - start + 1)){
+        if (vals[start + idx] > pivot) output[idx] = 1;
+    }
+}
+
+__global__ void gpu_pivot_reduce128(int* input, int* output){
+
+    // shared memory for the thread block for a chunk of A
+    __shared__ int data[128];
+
+    // indexing: thread index in block as well as overall index for all threads/blocks
+    unsigned int t_idx = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // move a chunk of A into shared memory
+    data[t_idx] = input[idx];
+    __syncthreads();
+
+    // s = spacing between sites: first iteration, compare neighbors, then compare 2 over, then 4 over, etc
+    for(unsigned int s = 1; s < blockDim.x; s *= 2){
+        
+        // only make the comparison if on a "zero" thread, ie one to replace with
+        if (t_idx % (2 * s) == 0){
+
+            // add the values
+            data[t_idx] = data[t_idx] + data[t_idx + s];
+
+            // synchronize threads before continuing
+            __syncthreads();
+        }
+    }
+
+    // when reach the end, output the very final result
+    if (t_idx == 0){
+        output[blockIdx.x] = data[0];
+    }
+}
+
+void gpu_find_pivot(float* vals, int* output, int start, int end){
+
+    // number of elements in sub array
+    int num2sum = end - start + 1;
+
+    // first, tag each element as greater than or less than pivot
+    gpu_compare_pivot128 <<< 1 + num2sum / 128, 128 >>> (vals, output, start, end);
+
+    // do the gpu reduction
+    int t_num2sum = num2sum;
+    while (t_num2sum / 128 > 0){
+        
+        // while more than one block, run the kernel
+        gpu_pivot_reduce128 <<< 1 + t_num2sum/128, 128 >>> (output, output);
+
+        // reduce element count for summation
+        t_num2sum = t_num2sum / 128;
+    }
+
+    // run once more
+    gpu_pivot_reduce128 <<< 1, 128 >>> (output, output);
+}
+
 // to swap floats, ints
 __device__ void gpu_swap_float(float* a, float* b){
     float temp = *a;
@@ -301,17 +374,22 @@ __global__ void gpu_find_swaps(float* input, int* pivot_idx, int* swapL, int* sw
     // pass each value for comparison to one thread
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // zero out updateL, updateR
-    *idxL = 0;
-    *idxR = 0;
+    // do some stuff first
+    if (idx == 0){
 
-    // swap the pivot before continuing
-    int s = *pivot_idx;
-    gpu_swap_float(input + start, input + start + s);
+        // zero out updateL, updateR
+        *idxL = 0;
+        *idxR = 0;
+
+        // swap the pivot before continuing
+        int s0 = *pivot_idx;
+        gpu_swap_float(input + start, input + start + s0);
+    }
     __syncthreads();
 
     // find the elements to swap
     if (idx < (end - start + 1)){
+        int s = *pivot_idx;
         if (idx < s && input[start + idx] < input[start + s]){
             int t_idx = atomicAdd(idxL, 1);
             swapL[t_idx] = idx;
@@ -353,6 +431,7 @@ void quick_sort(float* vals, int* I, int start, int end){
 void gpu_partition(float* vals, int start,  int end,   int* output, 
                    int* swapL,  int* swapR, int* idxL, int* idxR){
 
+    /*
     // number of elements in subarray
     int dim = end - start + 1;
 
@@ -389,9 +468,13 @@ void gpu_partition(float* vals, int start,  int end,   int* output,
         CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());  
 
     }
+    */
 
-    // reset dimension
-    dim = (end - start + 1);
+    // number of elements
+    int dim = end - start + 1;
+
+    // get pivot index
+    gpu_find_pivot(vals, output, start, end);
 
     // find which values to swap
     gpu_find_swaps <<< 1 + dim / 128, 128 >>> (vals, output, swapL, swapR, idxL, idxR, start, end);
@@ -405,16 +488,16 @@ void gpu_partition(float* vals, int start,  int end,   int* output,
     int temp;
     CUDA_CHECK(cudaMemcpy(&temp, output, sizeof(int), cudaMemcpyDeviceToHost));
     float ttemp;
-    CUDA_CHECK(cudaMemcpy(&ttemp, &vals[temp], sizeof(float), cudaMemcpyDeviceToHost));
-    std::cout << "Device pivot index = " << temp << std::endl;
+    CUDA_CHECK(cudaMemcpy(&ttemp, &vals[start + temp], sizeof(float), cudaMemcpyDeviceToHost));
+    std::cout << "Device pivot index = " << start + temp << std::endl;
     std::cout << "Device value at pivot = " << ttemp << std::endl << std::endl;
     CUDA_CHECK(cudaMemcpy(&temp, idxL, sizeof(int), cudaMemcpyDeviceToHost));
     std::cout << "idxL = " << temp << std::endl;
     CUDA_CHECK(cudaMemcpy(&temp, idxR, sizeof(int), cudaMemcpyDeviceToHost));
     std::cout << "idxR = " << temp << std::endl << std::endl;
 
-    CUDA_CHECK(cudaMemcpy(&ttemp, vals, sizeof(float), cudaMemcpyDeviceToHost));
-    std::cout << "New value at vals[0] = " << ttemp << std::endl << std::endl;
+    CUDA_CHECK(cudaMemcpy(&ttemp, vals + start, sizeof(float), cudaMemcpyDeviceToHost));
+    std::cout << "New value at vals[start] = " << ttemp << std::endl << std::endl;
 }
 
 void gpu_sort(float* vals, int start,  int end,   int* output, 
@@ -804,111 +887,17 @@ int main(){
     // size of matrices
     int dim = DIM;
 
-    /*
-    // start timing
-    // auto start = std::chrono::high_resolution_clock::now();
-
-    // load a matrix A to exponentiate
-    cuFloatComplex* A = new cuFloatComplex[dim * dim];
-    std::string a_name = "A";
-    read_array_from_file_C(A, a_name);
-
-    // print time of execution
-    // auto end = std::chrono::high_resolution_clock::now();
-    // std::chrono::duration<float> duration = end - start;
-    // std::cout << "The total elapsed time to read A into memory was " << duration.count() << "s" << std::endl;
-
-    // start timing
-    // start = std::chrono::high_resolution_clock::now();
-
-    // host pointers
-    cuFloatComplex* h_X      = new cuFloatComplex[dim * dim]; // for the solution
-    
-    // device pointers
-    cuFloatComplex* d_A;      // matrix to exponentiate
-    cuFloatComplex* d_P;      // P = V + U, pade approximant function
-    cuFloatComplex* d_Q;      // Q = V - U, pade approximant function
-    cuFloatComplex* d_X;      // X the solution
-
-    // allocate device memory
-    CUDA_CHECK(cudaMalloc(&d_A, dim * dim * sizeof(cuFloatComplex)));
-    CUDA_CHECK(cudaMalloc(&d_Q, dim * dim * sizeof(cuFloatComplex)));
-    CUDA_CHECK(cudaMalloc(&d_P, dim * dim * sizeof(cuFloatComplex)));
-    CUDA_CHECK(cudaMalloc(&d_X, dim * dim * sizeof(cuFloatComplex)));
-
-    // copy memory to device
-    CUDA_CHECK(cudaMemcpy(d_A, A, dim * dim * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
-
-    // create handles
-    cuHandles x;
-
-    // memory for balancing
-    float* y; CUDA_CHECK(cudaMalloc(&y, dim * sizeof(float)));
-
-    // random seed
-    srand(time(NULL));
-
-    // zero out vector y
-    balance_matrix_zero_y <<< 1 + dim/128, 128 >>> (y, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // memory for a copy of A for iterating
-    cuFloatComplex* tempA; CUDA_CHECK(cudaMalloc(&tempA, dim * dim * sizeof(cuFloatComplex)));
-
-    // memory for column, row norms
-    float* cNorms;  CUDA_CHECK(cudaMalloc(&cNorms, dim * sizeof(float)));
-    float* rNorms;  CUDA_CHECK(cudaMalloc(&rNorms, dim * sizeof(float)));
-
-    */
-
-    // memory for greedy indexing
-    float* d_weights; CUDA_CHECK(cudaMalloc(&d_weights, dim * sizeof(float)));
-    float* h_weights = new float[dim];
-    
-    // counter and batch information for iterating (batch = 20% of matrix at a time)
-    int counter = 0, batch_size = dim / 5;
+    // to sort
+    float* d_vals; CUDA_CHECK(cudaMalloc(&d_vals, dim * sizeof(float)));
+    float* h_vals = new float[dim];
 
     // memory for finding indices to adjust in each interation
     int* h_update = new int[dim];
-    int* d_update;  CUDA_CHECK(cudaMalloc(&d_update, batch_size * sizeof(int)));
     
     // index array for sorting
     int* idx_list = new int[dim];
     for (int i = 0; i < dim; i++) idx_list[i] = i;
     memcpy(h_update, idx_list, dim * sizeof(int));
-
-    /*
-    // memory for errors
-    float* err; CUDA_CHECK(cudaMalloc(&err, dim * sizeof(float)));
-
-    // start timing
-    auto net_start = std::chrono::high_resolution_clock::now();
-
-    // calculate norms
-    column_sum <<< 1 + dim/128, 128 >>> (d_A, cNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-    row_sum <<< 1 + dim/128, 128 >>> (d_A, rNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // calculate weights of columns, rows for greedy index picking
-    balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_weights, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // copy weights to host
-    CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // calculate errors
-    balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // get the maximal error = epsilon
-    float epsilon = 0.0; int result = 0;
-    CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
-    CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
-
-    // tolerance for balancing & value zero for weights
-    float tol = 0.01;
-    */
     
     // start and end values
     int start = 0;
@@ -920,328 +909,42 @@ int main(){
     for (int i = 0; i < dim; i++) {
         float x = (float) (rand() % 10000) / 100.0;
         while (x == pivot) x = (float) (rand() % 10000) / 100.0;
-        h_weights[i] = x;
+        h_vals[i] = x;
     }
-    h_weights[start] = pivot;
-    CUDA_CHECK(cudaMemcpy(d_weights, h_weights, dim * sizeof(float), cudaMemcpyHostToDevice));
+    h_vals[start] = pivot;
+    CUDA_CHECK(cudaMemcpy(d_vals, h_vals, dim * sizeof(float), cudaMemcpyHostToDevice));
 
     // memory for swaps
     int* output; CUDA_CHECK(cudaMalloc(&output, dim * sizeof(int)));
     int* swapL; CUDA_CHECK(cudaMalloc(&swapL, dim * sizeof(int))); int* swapR; CUDA_CHECK(cudaMalloc(&swapR, dim * sizeof(int)));
     int* idxL; CUDA_CHECK(cudaMalloc(&idxL, sizeof(int)));         int* idxR; CUDA_CHECK(cudaMalloc(&idxR, sizeof(int)));
 
-    // do the sorting
-    // gpu_sort(d_weights, start, end, output, swapL, swapR, idxL, idxR);
-
     // on gpu
-    gpu_partition(d_weights, start, end, output, swapL, swapR, idxL, idxR);
+    gpu_partition(d_vals, start, end, output, swapL, swapR, idxL, idxR);
 
     // get pivot
     int p; CUDA_CHECK(cudaMemcpy(&p, output, sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(d_weights, h_weights, dim * sizeof(float), cudaMemcpyHostToDevice));
+
+    // copy to host for some checks here
+    CUDA_CHECK(cudaMemcpy(h_vals, d_vals, dim * sizeof(float), cudaMemcpyDeviceToHost));
+    int p2 = partition(h_vals, h_update, start, p - 1);
+    std::cout << "Host pivot index = " << p2 << std::endl << std::endl;
+
+    // zero out the output memory
+    int* z = new int[dim];
+    for (int i = 0; i < dim; i++) z[i] = 0;
+    CUDA_CHECK(cudaMemcpy(output, z, dim * sizeof(int), cudaMemcpyHostToDevice));
 
     // run the partition on the left sub array
-    gpu_partition(d_weights, start, end, output, swapL, swapR, idxL, idxR);
+    // gpu_partition(d_vals, start, p - 1, output, swapL, swapR, idxL, idxR);
 
-    // on cpu
-    p = partition(h_weights, h_update, start, end);
-    std::cout << "Pivot value = " << h_weights[p] << std::endl;
-    std::cout << "Pivot index = " << p << std::endl;
+    // get pivot index
+    gpu_find_pivot(d_vals, output, start, p - 1);
 
-    // save h to file
-    std::string h_name = "host";
-    write_array_to_file_S(h_weights, h_name, dim);
-
-    // write d to file
-    std::string d_name = "device";
-    CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
-    write_array_to_file_S(h_weights, d_name, dim);
-
-    /*
-
-    // loop until within tolerance, or hit 5,000 iterations
-    while (epsilon > 1 + tol){
-
-        // if go too long, kill it
-        if (counter > 5000){
-            std::cout << "Unable to balance within 5,000 iterations. Ending balancing and outputting most recent balancing parameters." << std::endl;
-            break;
-        }
-
-        // sort the weights to get worst matches
-        quick_sort(h_weights, h_update, 0, dim - 1);   
-
-        // copy worst indices for update list to device
-        CUDA_CHECK(cudaMemcpy(d_update, h_update, batch_size * sizeof(int), cudaMemcpyHostToDevice));
-
-        // make the adjustment to y
-        balance_matrix_adjust_y <<< 1 + batch_size/128, 128 >>> (y, cNorms, rNorms, d_update, batch_size); // add a -1 if getting direct from greedy indexing
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // do the balancing step
-        balance_matrix_adjust_A <<< 1 + (dim * dim)/128, 128 >>> (d_A, tempA, y, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());     
-
-        // calculate all norms
-        column_sum <<< 1 + dim/128, 128 >>> (tempA, cNorms, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-        row_sum <<< 1 + dim/128, 128 >>> (tempA, rNorms, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());   
-
-        // calculate errors
-        balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // get the maximal error = epsilon
-        CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, err, 1, &result));
-        CUDA_CHECK(cudaMemcpy(&epsilon, err + result - 1, sizeof(float), cudaMemcpyDeviceToHost));
-
-        // calculate new weights for greedy index picking
-        balance_matrix_calculate_weights <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_weights, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // copy weights to host
-        CUDA_CHECK(cudaMemcpy(h_weights, d_weights, dim * sizeof(float), cudaMemcpyDeviceToHost));
-
-        // reset update array for next sort
-        memcpy(h_update, idx_list, dim * sizeof(int));
-
-        // update counter
-        counter = counter + batch_size;
-    }
-
-    // print balancing iterations
-    std::cout << "The number of iterations to balance was " << counter << std::endl;
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    auto net_end = std::chrono::high_resolution_clock::now();
-    duration = net_end - net_start;
-    std::cout << "The total elapsed time to balance A was " << duration.count() << "s" << std::endl;
-
-    // copy balancing vector to host
-    float* h_y = new float[dim];
-    CUDA_CHECK(cudaMemcpy(h_y, y, dim * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // write balancing vector to file
-    std::string y_name = "Y";
-    write_array_to_file_S(h_y, y_name, dim);
-    */
-
-    /*
-
-    // squaring step
-    int* nsquares = new int;
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to allocate memory, copy A to device, and create handles was " << duration.count() << "s" << std::endl;
-    
-    // start timing
-    start = std::chrono::high_resolution_clock::now();
-
-    // start timing for the whole process
-    auto net_start = std::chrono::high_resolution_clock::now();
-
-    // pre-process matrix by scaling, subtracting the trace, etc
-    cuFloatComplex TrA = pre_process(d_A, dim, x, nsquares);
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to pre-process was " << duration.count() << "s" << std::endl;
-
-    // start timing
-    start = std::chrono::high_resolution_clock::now();
-
-    // calculate numerator and denominator P and Q of pade approximant
-    calc_PQ(d_A, d_P, d_Q, dim, x);
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to calculate P and Q was " << duration.count() << "s" << std::endl;
-
-    // start timing
-    start = std::chrono::high_resolution_clock::now();
-
-    // linsolve: overwrites P with solution of linsolve
-    linsolve(d_P, d_Q, dim, x);
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to solve QX = P was " << duration.count() << "s" << std::endl;
-
-    // start timing
-    start = std::chrono::high_resolution_clock::now();
-
-    // reverse scaling, multiply by exp(-trace)
-    post_process(d_P, d_X, TrA, dim, x, nsquares);
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to post-process was " << duration.count() << "s" << std::endl;
-
-    // grab total time of execution
-    cudaDeviceSynchronize();
-    auto net_end = std::chrono::high_resolution_clock::now();
-
-    // start timing
-    start = std::chrono::high_resolution_clock::now();
-
-    // copy memory to host for error checking
-    CUDA_CHECK(cudaMemcpy(h_X, d_X, dim * dim * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to copy the solution to host was " << duration.count() << "s" << std::endl;
-
-    // start timing
-    start = std::chrono::high_resolution_clock::now();
-
-    // write X to file for error checking
-    std::string x_name = "X";
-    write_array_to_file_C(h_X, x_name, dim * dim);
-
-    // print time of execution
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to write the solution to a file was " << duration.count() << "s" << std::endl;
-
-    // print total execution time
-    duration = net_end - net_start;
-    std::cout << "\nThe total elapsed time to calculate expm(A) not counting preparatory steps was " << duration.count() << "s\n\n";
-    */
+    // get pivot
+    CUDA_CHECK(cudaMemcpy(&p, output, sizeof(int), cudaMemcpyDeviceToHost));
+    std::cout << "New device pivot index = " << p << std::endl << std::endl;
 
     // return
     return 0;
 }
-
-    /*
-    // memory for matrices
-    int dim_A = 10; int dim_B = 10;
-    cuFloatComplex* h_A = new cuFloatComplex[dim_A * dim_A];
-    cuFloatComplex* h_B = new cuFloatComplex[dim_B * dim_B];
-    cuFloatComplex* h_C = new cuFloatComplex[dim_A * dim_B * dim_A * dim_B];
-    cuFloatComplex* d_A; CUDA_CHECK(cudaMalloc(&d_A, dim_A * dim_A * sizeof(cuFloatComplex)));
-    cuFloatComplex* d_B; CUDA_CHECK(cudaMalloc(&d_B, dim_B * dim_B * sizeof(cuFloatComplex)));
-    cuFloatComplex* d_C; CUDA_CHECK(cudaMalloc(&d_C, dim_A * dim_B * dim_A * dim_B * sizeof(cuFloatComplex)));
-
-    // load matrices A, B
-    std::string a_name = "A"; std::string b_name = "B";
-    read_array_from_file_C(h_A, a_name); read_array_from_file_C(h_B, b_name);
-
-    // copy memory to device
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, dim_A * dim_A * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, dim_B * dim_B * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
-
-    // start timing for performing product
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // kronecker that ish
-    int nblocks = dim_A * dim_A * dim_B * dim_B / 256;
-    kron <<< nblocks + 1, 256 >>> (d_A, d_B, d_C, dim_A, dim_B);
-    CUDA_CHECK(cudaPeekAtLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // print time of execution
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<float> duration = end - start;
-    std::cout << "The total elapsed time to do the product was " << duration.count() << "s" << std::endl;
-
-    // copy to host
-    CUDA_CHECK(cudaMemcpy(h_C, d_C, dim_A * dim_B * dim_A * dim_B * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
-
-    // save to file
-    std::string c_name = "C";
-    write_array_to_file_C(h_C, c_name, dim_A * dim_B * dim_A * dim_B);
-
-    // free memory
-    delete [] h_A; delete [] h_B; delete [] h_C;
-    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_C));
-    */
-
-    /*
-    // start timing for loading hamiltonian
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // get the hamiltonian
-    cuFloatComplex* H = new cuFloatComplex[DIM * DIM];
-    std::string h_name = "H";
-    read_array_from_file_C(H, h_name);
-
-    // print the time taken to get hamiltonian
-    cudaDeviceSynchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<float> duration = end - start;
-    std::cout << "The total elapsed time to fetch H was " << duration.count() << "s" << std::endl;
-
-    // start timing for allocation
-    start = std::chrono::high_resolution_clock::now();
-
-    // host allocation for matrix to eigensolve, eigenvalues
-    int dim = DIM;
-    cuFloatComplex* h_A = new cuFloatComplex[dim * dim];
-    cuFloatComplex* h_U = new cuFloatComplex[dim * dim];
-    float* h_D = new float[dim]; // real valued eigenvalues since hermitian
-
-    // device allocation for matrix to eigensolve, eigenvalues
-    cuFloatComplex* d_A; CUDA_CHECK(cudaMalloc(&d_A, dim * dim * sizeof(cuFloatComplex)));
-    float* d_D;          CUDA_CHECK(cudaMalloc(&d_D, dim * sizeof(float)));
-
-    // copy hamiltonian to A on host and device
-    memcpy(h_A, H, dim * dim * sizeof(cuFloatComplex));
-    CUDA_CHECK(cudaMemcpy(d_A, H, dim * dim * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
-
-    // print the time taken to prepare dataStruct
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to prepare memory was " << duration.count() << "s" << std::endl;
-
-    // start timing for eigensolving
-    start = std::chrono::high_resolution_clock::now();
-
-    // do the solving
-    eigensolve(d_A, d_D, dim);
-
-    // print the time taken to eigensolve
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to eigensolve was " << duration.count() << "s" << std::endl;
-
-    // start timing for saving the result
-    start = std::chrono::high_resolution_clock::now();
-
-    // copy results to host
-    CUDA_CHECK(cudaMemcpy(h_U, d_A, DIM * DIM * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_D, d_D, DIM * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // write to files
-    std::string d_name = "D"; std::string u_name = "U";
-    write_array_to_file_S(h_D, d_name, DIM);
-    write_array_to_file_C(h_U, u_name, DIM * DIM);
-
-    // print the time taken to eigensolve
-    cudaDeviceSynchronize();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The total elapsed time to fetch the result and write to a file was " << duration.count() << "s" << std::endl;
-
-    // free all memory
-    delete [] h_A; delete [] h_U; delete [] h_D; delete [] H;
-    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_D));
-
-    */
