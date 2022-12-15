@@ -102,7 +102,7 @@ __global__ void column_norm128(cuFloatComplex* d_A, float* output, int row_dim, 
         }
         __syncthreads();
 
-        // do the standard reduction w/ interleaved indexing
+        // do reduction like in nvidia ppt
         for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1){
             
             // only make the comparison if on a "zero" thread, ie one to replace with
@@ -110,7 +110,6 @@ __global__ void column_norm128(cuFloatComplex* d_A, float* output, int row_dim, 
 
                 // add the values
                 data[t_idx] = __fadd_rn(data[t_idx], data[t_idx + s]);
-                
             }
 
             // synchronize threads before continuing
@@ -127,8 +126,7 @@ __global__ void column_norm128(cuFloatComplex* d_A, float* output, int row_dim, 
 void column_norm(cuFloatComplex* d_A, float* output, int dim){
 
     // generate the initial grid: num_x = number of elements in the x direction, num_y = number of columns
-    int num_x = dim, num_y = dim, numBlockperCol = dim / 128, itr = 0;
-    if (dim % 128 != 0) numBlockperCol++;
+    int num_x = dim, num_y = dim, numBlockperCol = 1 + dim / 128, itr = 0;
 
     // block & grid dimensions: each block = 1D w/ 128 threads
     dim3 block(128, 1), grid(numBlockperCol, num_y);
@@ -138,14 +136,13 @@ void column_norm(cuFloatComplex* d_A, float* output, int dim){
         
         // run the first reduction
         column_norm128 <<< grid, block >>> (d_A, output, num_x, dim, numBlockperCol, itr);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaPeekAtLastError());
 
         // number of elements along x is now equal to number of blocks per column
         num_x = numBlockperCol;
 
         // recalculate number of blocks per column
-        numBlockperCol = num_x / 128;
-        if (num_x % 128 != 0) numBlockperCol++;
+        numBlockperCol = 1 + num_x / 128;
 
         // change the grid size
         grid.x = numBlockperCol;
@@ -156,7 +153,7 @@ void column_norm(cuFloatComplex* d_A, float* output, int dim){
 
     // run once more to complete the reduction
     column_norm128 <<< grid, block >>> (d_A, output, num_x, dim, numBlockperCol, itr);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaPeekAtLastError());
 }
 
 __global__ void row_sum(cuFloatComplex* d_A, float* normA, int dim){
@@ -746,24 +743,26 @@ int main(){
 
     // calculate column norms the old way
     start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 100000; i++){
-        column_sum <<< 1 + dim / 128, 128 >>> (d_A, cNorms, dim);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-    // CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+    column_sum <<< 1 + dim / 128, 128 >>> (d_A, cNorms, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
     end = std::chrono::high_resolution_clock::now();
     duration = end - start;
-    std::cout << "The average elapsed time for the original calculation was " << duration.count() / 100 << "ms" << std::endl;
+    std::cout << "The average elapsed time for the original calculation was " << duration.count() * 1000 << "ms" << std::endl;
 
     // calculate the new way (need new memory)
     float* tnorm; CUDA_CHECK(cudaMalloc(&tnorm, (dim * dim / 128) * sizeof(float)));
     start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 100000; i++){
-        column_norm(d_A, tnorm, dim);
-    }
+    column_norm(d_A, tnorm, dim);
+    CUDA_CHECK(cudaDeviceSynchronize());
     end = std::chrono::high_resolution_clock::now();
     duration = end - start;
-    std::cout << "The average elapsed time for the new calculation was " << duration.count() / 100 << "ms" << std::endl;
+    std::cout << "The average elapsed time for the new calculation was " << duration.count() * 1000 << "ms" << std::endl;
+
+    start = std::chrono::high_resolution_clock::now();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    end = std::chrono::high_resolution_clock::now();
+    duration = end - start;
+    std::cout << "The average elapsed time to synchronize the device was " << duration.count() * 1000 << "ms" << std::endl;
 
     // memory for copying to host
     float* h_norms = new float[dim];
