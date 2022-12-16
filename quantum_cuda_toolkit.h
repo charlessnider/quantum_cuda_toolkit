@@ -33,6 +33,9 @@ struct dataHolder{
 
     // PRE/POST-PROCESSING POINTERS
 
+        // whether to display how many iterations it takes to balance the matrix
+        int* print_itr;
+
         // host pointers
         cuFloatComplex* TrA; // trace of the matrix being exponentiated
         float* h_err; // for matrix balancing: errors of each index in matrix for greedy indexing
@@ -44,7 +47,7 @@ struct dataHolder{
 
         // device pointers
         cuFloatComplex* d_mid; // the value -1
-        cuFloatComplex* d_x; cuFloatComplex* d_y; // intermediate storage for squaring in post-processing
+        cuFloatComplex* d_x, * d_y; // intermediate storage for squaring in post-processing
         cuFloatComplex* tempA; // for matrix balancing: temporary storage for each update of A during balancing
         float* tNorms; // temporary memory for reductions for norm calculations
         float* cNorms; // for matrix balancing: column norms of matrix to exponentiate
@@ -64,7 +67,10 @@ struct dataHolder{
         cuFloatComplex* A2; // to hold the square of A
         cuFloatComplex* A4; // to hold A to the 4th
         cuFloatComplex* A6; // to hold A to the 6th
-        cuFloatComplex* U1; cuFloatComplex* U2; cuFloatComplex* V1; cuFloatComplex* V2; // intermediate storage for P, Q calculation
+        cuFloatComplex* U1; // intermediate storage for P, Q calculation
+        cuFloatComplex* U2; // intermediate storage for P, Q calculation
+        cuFloatComplex* V1; // intermediate storage for P, Q calculation
+        cuFloatComplex* V2; // intermediate storage for P, Q calculation
         cuFloatComplex* d_P; // numerator of pade approximant
         cuFloatComplex* d_Q; // denominator of pade approximant
 
@@ -75,24 +81,31 @@ struct dataHolder{
         int* devInfo; // output for success/failure of solver
 };
 
-dataHolder prep_expm_memory(int dim){
+dataHolder prep_expm_memory(int dim, float batch_frac = 0.2, float tol = 0.01, int print_balancing_iterations = 0){
 
     // CREATE THE STRUCTURE
     dataHolder x;
+
+    // batch size
+    int batch_size = (int) (dim * batch_frac);
 
     // FINAL OUTPUT OF expm ALGORITHM
     CUDA_CHECK(cudaMalloc(&x.d_X, dim * dim * sizeof(cuFloatComplex)));
 
     // PRE/POST-PROCESSING POINTERS
 
+        // whether to display how many iterations it takes to balance the matrix
+        x.print_itr = (int*) malloc(sizeof(int));
+        *(x.print_itr) = print_balancing_iterations;
+
         // host pointers
         x.TrA = (cuFloatComplex*) malloc(sizeof(cuFloatComplex)); // trace of the matrix being exponentiated
         x.h_err = (float*) malloc(dim * sizeof(float)); // for matrix balancing: errors of each index in matrix for greedy indexing
-        x.tol = (float*) malloc(sizeof(float)); *x.tol = 0.01; // for matrix balancing: the error toleranace, default value of 0.01;
+        x.tol = (float*) malloc(sizeof(float)); *x.tol = tol; // for matrix balancing: the error toleranace, default value of 0.01;
         x.nsquares = (int*) malloc(sizeof(int)); // number of squarings necessary to undo scaling
         x.h_update = (int*) malloc(dim * sizeof(int)); // for matrix balancing: which rows/column indices to udpate at each step
         x.idx_list = (int*) malloc(dim * sizeof(int)); // for matrix balancing: base version of h_update to reset before sorting
-        x.batch_size = (int*) malloc(sizeof(int)); *x.batch_size = dim / 5; // for matrix balancing: the how many indices you want to update at each step, default value of 1/5 the matrix at a time
+        x.batch_size = (int*) malloc(sizeof(int)); *(x.batch_size) = batch_size; // for matrix balancing: the how many indices you want to update at each step, default value of 1/5 the matrix at a time
 
         // device pointers
         CUDA_CHECK(cudaMalloc(&x.d_mid, sizeof(cuFloatComplex))); // the value -1
@@ -104,7 +117,7 @@ dataHolder prep_expm_memory(int dim){
         CUDA_CHECK(cudaMalloc(&x.rNorms, dim * sizeof(float))); // for matrix balancing: row norms of matrix to exponentiate
         CUDA_CHECK(cudaMalloc(&x.d_err, dim * sizeof(float))); // for matrix balancing: errors of each index in matrix for greedy indexing
         CUDA_CHECK(cudaMalloc(&x.y, dim * sizeof(float))); // for matrix balancing: the balancing vector, output of balancing algorithm
-        CUDA_CHECK(cudaMalloc(&x.d_update, (*x.batch_size) * sizeof(int))); // for matrix balancing: which rows/column indices to udpate at each step
+        CUDA_CHECK(cudaMalloc(&x.d_update, batch_size * sizeof(int))); // for matrix balancing: which rows/column indices to udpate at each step
 
     // CALCULATION OF P AND Q POINTERS
 
@@ -158,6 +171,59 @@ dataHolder prep_expm_memory(int dim){
 
     // return the structure
     return x;
+}
+
+void free_expm_memory(dataHolder x){
+
+    // FINAL OUTPUT OF expm ALGORITHM
+    CUDA_CHECK(cudaFree(x.d_X));
+
+    // PRE/POST-PROCESSING POINTERS
+
+        // host pointers
+        free(x.TrA); // trace of the matrix being exponentiated
+        free(x.h_err); // for matrix balancing: errors of each index in matrix for greedy indexing
+        free(x.tol); // for matrix balancing: the error toleranace
+        free(x.nsquares); // number of squarings necessary to undo scaling
+        free(x.h_update); // for matrix balancing: which rows/column indices to udpate at each step
+        free(x.idx_list); // for matrix balancing: base version of h_update to reset before sorting
+        free(x.batch_size); // for matrix balancing: the how many indices you want to update at each step
+
+        // device pointers
+        CUDA_CHECK(cudaFree(x.d_mid)); // the value -1
+        CUDA_CHECK(cudaFree(x.d_x)); // intermediate storage for squaring in post-processing
+        CUDA_CHECK(cudaFree(x.d_y)); // intermediate storage for squaring in post-processing
+        CUDA_CHECK(cudaFree(x.tempA)); // for matrix balancing: temporary storage for each update of A during balancing
+        CUDA_CHECK(cudaFree(x.tNorms)); // temporary memory for reductions for norm calculations
+        CUDA_CHECK(cudaFree(x.cNorms)); // for matrix balancing: column norms of matrix to exponentiate
+        CUDA_CHECK(cudaFree(x.rNorms)); // for matrix balancing: row norms of matrix to exponentiate
+        CUDA_CHECK(cudaFree(x.d_err)); // for matrix balancing: errors of each index in matrix for greedy indexing
+        CUDA_CHECK(cudaFree(x.y)); // for matrix balancing: the balancing vector, output of balancing algorithm
+        CUDA_CHECK(cudaFree(x.d_update)); // for matrix balancing: which rows/column indices to udpate at each step
+
+    // CALCULATION OF P AND Q POINTERS
+
+        // host pointers
+        free(x.C); // pade approximant coefficients
+
+        // device pointers
+        CUDA_CHECK(cudaFree(x.d_z)); // the value zero on the device
+        CUDA_CHECK(cudaFree(x.d_id)); // the value 1 on the device
+        CUDA_CHECK(cudaFree(x.A2)); // to hold the square of A
+        CUDA_CHECK(cudaFree(x.A4)); // to hold A to the 4th
+        CUDA_CHECK(cudaFree(x.A6)); // to hold A to the 6th
+        CUDA_CHECK(cudaFree(x.U1)); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaFree(x.U2)); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaFree(x.V1)); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaFree(x.V2)); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaFree(x.d_P)); // numerator of pade approximant
+        CUDA_CHECK(cudaFree(x.d_Q)); // denominator of pade approximant
+
+    // LINSOLVE POINTERS
+
+        // device pointers
+        CUDA_CHECK(cudaFree(x.d_ipiv)); // pivot info for solver
+        CUDA_CHECK(cudaFree(x.devInfo)); // output for success/failure of solver
 }
 
 // MATRIX OPERATIONS
