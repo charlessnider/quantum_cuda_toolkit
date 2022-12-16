@@ -32,7 +32,9 @@
 // size of matrix in question
 int DIM = 1024;
 
-// MATRIX TRACE
+// 
+
+// MATRIX TRACE WITH CUBLAS
 cuFloatComplex trace(cuFloatComplex* d_A, int dim, cuHandles x){
 
     // use dot product to calculate trace, idea stolen from scikit-cuda
@@ -60,7 +62,84 @@ cuFloatComplex trace(cuFloatComplex* d_A, int dim, cuHandles x){
     return result;
 }
 
-// MATRIX NORMS
+// EFFICIENT COLUMN MATRIX NORM CALCULATION (https://cuvilib.com/Reduction.pdf)
+__global__ void gpu_column_norm128_double_load(cuFloatComplex* d_A, float* output, int row_dim, int col_dim, int itr){
+
+    // variables to consider
+    // row_dim = number of rows (gets cut by 128 after each kernel execution, consider intermediate outputs as matrices)
+    // col_dim = number of columns (remains constant)
+
+    // shared memory for the thread block for a chunk of A
+    __shared__ float data[128];
+
+    // indexing: 2d grid of 1d blocks-- each "row" of blocks (along x) works on one column
+    unsigned int t_idx = threadIdx.x; // index in current block
+    unsigned int col_idx = blockIdx.y; // which column we are working with = y index of grid
+    unsigned int row_idx = blockIdx.x * (2 * blockDim.x) + threadIdx.x; // which element of the column (ie which row of A) we are working with
+
+    // on the first iteration, move a chunk of A into shared memory & do one reduction
+    data[t_idx] = 0.0; // by default set the memory to zero, basically zero padding the number of rows to a multiple of 128
+    if (itr == 0){
+        if (row_idx < row_dim) data[t_idx] = my_cuCabsf(d_A[row_dim * col_idx + row_idx]); // if within matrix bounds, load from d_A
+        if (row_idx + blockDim.x < row_dim) data[t_idx] = __fadd_rn(data[t_idx], my_cuCabsf(d_A[row_dim * col_idx + row_idx + blockDim.x]));
+    } else { // on the second, pull from the previous iteration's output
+        if (row_idx < row_dim) data[t_idx] = output[row_dim * col_idx + row_idx];
+        if (row_idx + blockDim.x < row_dim) data[t_idx] = __fadd_rn(data[t_idx], output[row_dim * col_idx + row_idx + blockDim.x]);
+    }
+    __syncthreads();
+
+    // do reduction like in nvidia ppt
+    for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1){
+        
+        // only make the comparison if on a "zero" thread, ie one to replace with
+        if (t_idx < s){
+
+            // add the values
+            data[t_idx] = __fadd_rn(data[t_idx], data[t_idx + s]);
+        }
+        __syncthreads();
+    }
+
+    // at the end of the process, save the result to the output: blockIdx.x is the new row index, col_idx remains the same
+    if (t_idx == 0){
+        output[gridDim.x * col_idx + blockIdx.x] = data[0];
+    }
+}
+
+void column_norm(cuFloatComplex* d_A, float* output, int dim){
+
+    // generate the initial grid: num_x = number of elements in the x direction, num_y = number of columns
+    int num_x = dim, num_y = dim, numBlockperCol = 1 + (1 + dim / 128) / 2, itr = 0;
+
+    // block & grid dimensions: each block = 1D w/ 128 threads
+    dim3 block(128, 1), grid(numBlockperCol, num_y);
+
+    // loop until down to one block (one block covers 2x number of threads with double loading)
+    while (num_x > 256){
+        
+        // run the first reduction
+        gpu_column_norm128_double_load <<< grid, block >>> (d_A, output, num_x, dim, itr);
+        CUDA_CHECK(cudaPeekAtLastError());
+
+        // number of elements along x is now equal to number of blocks per column
+        num_x = numBlockperCol;
+
+        // recalculate number of blocks per column
+        numBlockperCol = 1 + (1 + num_x / 128) / 2;
+
+        // change the grid size
+        grid.x = numBlockperCol;
+
+        // increment the iteration
+        itr++;
+    }
+
+    // run once more to complete the reduction
+    gpu_column_norm128_double_load <<< grid, block >>> (d_A, output, num_x, dim, itr);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+// OLD INEFFICIENT (AND BASIC) COLUMN MATRIX NORM CALCULATION
 __global__ void column_sum(cuFloatComplex* d_A, float* normA, int dim){
 
     // one thread gets each column
@@ -75,7 +154,8 @@ __global__ void column_sum(cuFloatComplex* d_A, float* normA, int dim){
     }
 }
 
-__global__ void column_norm128(cuFloatComplex* d_A, float* output, int row_dim, int col_dim, int numBlockperCol, int itr){
+// EFFICIENT ROW MATRIX NORM CALCULATION (https://cuvilib.com/Reduction.pdf)
+__global__ void gpu_row_norm128_double_load(cuFloatComplex* d_A, float* output, int row_dim, int col_dim, int itr){
 
     // variables to consider
     // row_dim = number of rows (gets cut by 128 after each kernel execution, consider intermediate outputs as matrices)
@@ -86,76 +166,72 @@ __global__ void column_norm128(cuFloatComplex* d_A, float* output, int row_dim, 
 
     // indexing: 2d grid of 1d blocks-- each "row" of blocks (along x) works on one column
     unsigned int t_idx = threadIdx.x; // index in current block
-    unsigned int col_idx = blockIdx.y; // which column we are working with = y index of grid
-    unsigned int row_idx = blockIdx.x * blockDim.x + threadIdx.x; // which element of the column (ie which row of A) we are working with
+    unsigned int row_idx = blockIdx.y; // which row we are working with = y index of grid
+    unsigned int col_idx = blockIdx.x * (2 * blockDim.x) + threadIdx.x; // which element of the row (ie which column of A) we are working with
 
-    // only launch if in the right range
-    if (col_idx < col_dim){
+    // on the first iteration, move a chunk of A into shared memory & do one reduction
+    data[t_idx] = 0.0; // by default set the memory to zero, basically zero padding the number of rows to a multiple of 128
+    if (itr == 0){
+        if (col_idx < col_dim) data[t_idx] = my_cuCabsf(d_A[row_dim * col_idx + row_idx]); // if within matrix bounds, load from d_A
+        if (col_idx + blockDim.x < col_dim) data[t_idx] = __fadd_rn(data[t_idx], my_cuCabsf(d_A[row_dim * (col_idx + blockDim.x) + row_idx]));
+    } else { // on the second, pull from the previous iteration's output
+        if (col_idx < col_dim) data[t_idx] = output[row_dim * col_idx + row_idx];
+        if (col_idx + blockDim.x < col_dim) data[t_idx] = __fadd_rn(data[t_idx], output[row_dim * (col_idx + blockDim.x) + row_idx]);
+    }
+    __syncthreads();
 
-        // on the first iteration, move a chunk of A into shared memory
-        if (itr == 0){
-            data[t_idx] = 0.0; // by default set the memory to zero, basically zero padding the number of rows to a multiple of 128
-            if (row_idx < row_dim) data[t_idx] = my_cuCabsf(d_A[row_dim * col_idx + row_idx]); // if within matrix bounds, load from d_A
-        } else { // on the second, pull from the previous iteration's output
-            data[t_idx] = 0.0;
-            if (row_idx < row_dim) data[t_idx] = output[row_dim * col_idx + row_idx];
+    // do reduction like in nvidia ppt
+    for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1){
+        
+        // only make the comparison if on a "zero" thread, ie one to replace with
+        if (t_idx < s){
+
+            // add the values
+            data[t_idx] = __fadd_rn(data[t_idx], data[t_idx + s]);
         }
         __syncthreads();
+    }
 
-        // do reduction like in nvidia ppt
-        for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1){
-            
-            // only make the comparison if on a "zero" thread, ie one to replace with
-            if (t_idx < s){
-
-                // add the values
-                data[t_idx] = __fadd_rn(data[t_idx], data[t_idx + s]);
-            }
-
-            // synchronize threads before continuing
-            __syncthreads();
-        }
-
-        // at the end of the process, save the result to the output: blockIdx.x is the new row index, col_idx remains the same
-        if (t_idx == 0){
-            output[numBlockperCol * col_idx + blockIdx.x] = data[0];
-        }
+    // at the end of the process, save the result to the output: blockIdx.x is the new row index, col_idx remains the same
+    if (t_idx == 0){
+        output[row_dim * blockIdx.x + row_idx] = data[0];
     }
 }
 
-void column_norm(cuFloatComplex* d_A, float* output, int dim){
+void row_norm(cuFloatComplex* d_A, float* output, int dim){
 
     // generate the initial grid: num_x = number of elements in the x direction, num_y = number of columns
-    int num_x = dim, num_y = dim, numBlockperCol = 1 + dim / 128, itr = 0;
+    int num_x = dim, num_y = dim, numBlockperRow = 1 + (1 + dim / 128) / 2, itr = 0;
 
     // block & grid dimensions: each block = 1D w/ 128 threads
-    dim3 block(128, 1), grid(numBlockperCol, num_y);
+    dim3 block(128, 1), grid(numBlockperRow, num_y);
 
-    // loop until down to one block in the x direction
-    while (num_x > 128){
+    // loop until down to one block (one block covers 2x number of threads with double loading)
+    while (num_x > 256){
         
         // run the first reduction
-        column_norm128 <<< grid, block >>> (d_A, output, num_x, dim, numBlockperCol, itr);
+        gpu_row_norm128_double_load <<< grid, block >>> (d_A, output, dim, num_x, itr);
         CUDA_CHECK(cudaPeekAtLastError());
 
         // number of elements along x is now equal to number of blocks per column
-        num_x = numBlockperCol;
+        num_x = numBlockperRow;
 
         // recalculate number of blocks per column
-        numBlockperCol = 1 + num_x / 128;
+        numBlockperRow = 1 + (1 + num_x / 128) / 2;
 
         // change the grid size
-        grid.x = numBlockperCol;
+        grid.x = numBlockperRow;
 
         // increment the iteration
         itr++;
     }
 
     // run once more to complete the reduction
-    column_norm128 <<< grid, block >>> (d_A, output, num_x, dim, numBlockperCol, itr);
+    gpu_row_norm128_double_load <<< grid, block >>> (d_A, output, dim, num_x, itr);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
+// OLD INEFFICIENT (AND BASIC) ROW MATRIX NORM CALCULATION
 __global__ void row_sum(cuFloatComplex* d_A, float* normA, int dim){
 
     // one thread gets each row
@@ -188,7 +264,7 @@ __global__ void balance_matrix_calc_errors(float* cNorms, float* rNorms, float* 
 
 __global__ void balance_matrix_adjust_y(float* y, float* cNorms, float* rNorms, int* update_list, int batch_size){
 
-    // just give it to a thread
+    // just give each adjustment to a thread
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size){    
         int jdx = update_list[idx];
@@ -199,7 +275,7 @@ __global__ void balance_matrix_adjust_y(float* y, float* cNorms, float* rNorms, 
 
 __global__ void balance_matrix_zero_y(float* y, int dim){
 
-    // one thread = one element of A to adjust
+    // one thread = one element of y to zero out
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < dim){
         y[idx] = 0.0;
@@ -208,28 +284,17 @@ __global__ void balance_matrix_zero_y(float* y, int dim){
 
 __global__ void balance_matrix_adjust_A(cuFloatComplex* d_A, cuFloatComplex* tempA, float* y, int dim){
 
-    // one thread = one element of A to adjust
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < dim * dim){
+    // use same configurations from matrix norm
+    int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int col_idx = blockIdx.y;
 
-        // get indices i, j from idx
-        int i = idx % dim;
-        int j = (idx - i) / dim;
+    if (row_idx < dim){
 
         // calculate Dii x invDjj
-        cuFloatComplex val = make_cuFloatComplex(expf(__fsub_rn(y[i], y[j])), 0.0);
+        cuFloatComplex val = make_cuFloatComplex(expf(__fsub_rn(y[row_idx], y[col_idx])), 0.0);
     
         // adjust Aij
-        tempA[idx] = my_cuCmulf(d_A[idx], val);
-    }
-}
-
-__global__ void balance_matrix_calculate_weights(float* cNorms, float* rNorms, float* weights, int dim){
-
-    // one thread = one comparison
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < dim){
-        weights[idx] = fabsf(__fsub_rn(sqrtf(rNorms[idx]), sqrtf(cNorms[idx])));
+        tempA[dim * col_idx + row_idx] = my_cuCmulf(d_A[dim * col_idx + row_idx], val);
     }
 }
 
@@ -277,44 +342,6 @@ int partition(float* vals, int* I, int start, int end){
     return pivot_idx;
 }
 
-// GPU INT REDUCTION: https://cuvilib.com/Reduction.pdf
-__global__ void gpu_sum_int128(int* input, int* output, int dim){
-
-    // shared memory for the thread block for a chunk of A
-    __shared__ int data[128];
-
-    // indexing: thread index in block as well as overall index for all threads/blocks
-    unsigned int t_idx = threadIdx.x;
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // only launch if in the right range
-    if (idx < dim){
-
-        // move a chunk of A into shared memory
-        data[t_idx] = input[idx];
-        __syncthreads();
-
-        // s = spacing between sites: first iteration, compare neighbors, then compare 2 over, then 4 over, etc
-        for(unsigned int s = 1; s < blockDim.x; s *= 2){
-            
-            // only make the comparison if on a "zero" thread, ie one to replace with
-            if (t_idx % (2 * s) == 0){
-
-                // add the values
-                data[t_idx] = data[t_idx] + data[t_idx + s];
-
-                // synchronize threads before continuing
-                __syncthreads();
-            }
-        }
-
-        // when reach the end, output the very final result
-        if (t_idx == 0){
-            output[blockIdx.x] = data[0];
-        }
-    }
-}
-
 void quick_sort(float* vals, int* I, int start, int end){
 
     // kill if start is to right of end/no more sorting to do
@@ -328,6 +355,73 @@ void quick_sort(float* vals, int* I, int start, int end){
     // recursively do left and right parts
     quick_sort(vals, I, start, p - 1);
     quick_sort(vals, I, p + 1, end);
+}
+
+// MATRIX BALANCING
+void batch_greedy_osborne(cuFloatComplex* d_A, float tol, int batch_size,
+                          int* d_update, int* h_update, int* idx_list, cuHandles x,
+                          float* cNorms, float* rNorms, float* tNorms, int dim,
+                          float* d_err,  float* h_err, float* y, cuFloatComplex* tempA, int print_itr){
+
+    // necessary parameters for matrix balancing
+    dim3 block(128, 1), grid(1 + dim / 128, dim); // grid for adjustment of A to reduce necessity of modulus operators
+    int counter = 0;                              // batch size (numer of row/col adjustments to make each iteration)
+
+    // calculate column norm and copy to cNorms
+    column_norm(d_A, tNorms, dim); CUBLAS_CHECK(cublasScopy(x.cublasH, dim, tNorms, 1, cNorms, 1));
+    row_norm(d_A, tNorms, dim);    CUBLAS_CHECK(cublasScopy(x.cublasH, dim, tNorms, 1, rNorms, 1));
+
+    // calculate errors
+    balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_err, dim);
+    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    // move to host for sorting
+    CUDA_CHECK(cudaMemcpy(h_err, d_err, dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // sort the errors to get worst matches
+    quick_sort(h_err, h_update, 0, dim - 1);
+
+    // loop until within tolerance, or hit 5,000 iterations
+    while (h_err[0] > 1 + tol){
+
+        // if go too long, kill it
+        if (counter > 5000){
+            std::cout << "Unable to balance within 5,000 iterations. Ending balancing and outputting most recent balancing parameters." << std::endl;
+            return;
+        }
+
+        // copy worst indices for update list to device
+        CUDA_CHECK(cudaMemcpy(d_update, h_update, batch_size * sizeof(int), cudaMemcpyHostToDevice));
+
+        // make the adjustment to y
+        balance_matrix_adjust_y <<< 1 + batch_size / 128, 128 >>> (y, cNorms, rNorms, d_update, batch_size); // add a -1 if getting direct from greedy indexing
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // do the balancing step
+        balance_matrix_adjust_A <<< grid, block >>> (d_A, tempA, y, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());     
+
+        // calculate column norm and copy to cNorms
+        column_norm(tempA, tNorms, dim); CUBLAS_CHECK(cublasScopy(x.cublasH, dim, tNorms, 1, cNorms, 1));
+        row_norm(tempA, tNorms, dim);    CUBLAS_CHECK(cublasScopy(x.cublasH, dim, tNorms, 1, rNorms, 1));
+
+        // calculate errors
+        balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_err, dim);
+        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+        // copy errors to host
+        CUDA_CHECK(cudaMemcpy(h_err, d_err, dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // reset update array for next sort
+        memcpy(h_update, idx_list, dim * sizeof(int));
+
+        // sort the errors to get worst matches
+        quick_sort(h_err, h_update, 0, dim - 1);
+
+        // update counter
+        counter = counter + batch_size;
+    }
+    if (print_itr == 1) std::cout << "The number of iterations to balance was " << counter << std::endl;
 }
 
 // PREPROCESSING
@@ -356,16 +450,15 @@ cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int* nsqua
     // balance the matrix
 
     // calculate matrix norm (maximal column sum)
-    float* normA; CUDA_CHECK(cudaMalloc(&normA, dim * sizeof(float)));
-    column_sum <<< 1 + dim/32, 32 >>> (d_A, normA, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize()); // check errors for kernel
+    float* cNorms; CUDA_CHECK(cudaMalloc(&cNorms, (dim * (1 + (1 + dim / 128) / 2) * sizeof(float))));
+    column_norm(d_A, cNorms, dim);
 
     // get maximal column sum to decide scale factor
     int idx;
-    CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, normA, 1, &idx));
+    CUBLAS_CHECK(cublasIsamax(x.cublasH, dim, cNorms, 1, &idx));
 
     // copy over value of maximal column sum to host
-    float nA; CUDA_CHECK(cudaMemcpy(&nA, normA + idx, sizeof(float), cudaMemcpyDeviceToHost));
+    float nA; CUDA_CHECK(cudaMemcpy(&nA, cNorms + idx - 1, sizeof(float), cudaMemcpyDeviceToHost)); // cuBLAS using 1 indexing
 
     // calculate log2(scale factor) & save for later
     *nsquares = (int) ceilf(log2f(nA / 5.371920351148152));
@@ -375,9 +468,6 @@ cuFloatComplex pre_process(cuFloatComplex* d_A, int dim, cuHandles x, int* nsqua
 
     // scale
     CUBLAS_CHECK(cublasCscal(x.cublasH, dim * dim, &s, d_A, 1));
-
-    // free the memory just in case
-    CUDA_CHECK(cudaFree(one)); CUDA_CHECK(cudaFree(normA));
 
     // return the trace, for use later
     return TrA;
@@ -449,9 +539,6 @@ void post_process(cuFloatComplex* d_P, cuFloatComplex* d_X, cuFloatComplex TrA, 
 
     // scale the matrix d_X which holds the result
     CUBLAS_CHECK(cublasCscal(x.cublasH, dim * dim, &exp_TrA, d_X, 1));
-
-    // free all allocated cuda memory just in case
-    CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y));
 }
 
 // LINSOLVE
@@ -476,9 +563,6 @@ void linsolve(cuFloatComplex* d_P, cuFloatComplex* d_Q, int dim, cuHandles x){
 
     // solve & overwrite P with solution X (solves QX = P)
     CUSOLVER_CHECK(cusolverDnCgetrs(x.cusolverH, CUBLAS_OP_N, dim, dim, d_Q, dim, d_ipiv, d_P, dim, devInfo));
-
-    // free memory just in case
-    CUDA_CHECK(cudaFree(d_ipiv)); CUDA_CHECK(cudaFree(devInfo)); CUDA_CHECK(cudaFree(work));
 }
 
 // PADE APPROXIMANT POLYNOMIALS (SERIAL CALCULATION, VARIABLE m)
@@ -578,9 +662,6 @@ void calc_PQ_seq(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, 
             CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &coefQ[idx + 3], d_x, 1, d_Q, 1));
         }
     }
-
-    // free all allocated cuda memory just in case
-    CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y));
 }
 
 // FASTER WAY TO CALCULATE P AND Q BUT STRICTLY FOR m = 13
@@ -684,11 +765,6 @@ void calc_PQ(cuFloatComplex* d_A, cuFloatComplex* d_P, cuFloatComplex* d_Q, int 
 
     // subtract U (stored in U1) from Q
     CUBLAS_CHECK(cublasCaxpy(x.cublasH, dim * dim, &mid, U1, 1, d_Q, 1)); // Q = V - U, overwrites Q
-
-    // free all allocated cuda memory just in case
-    CUDA_CHECK(cudaFree(U1));  CUDA_CHECK(cudaFree(U2));  CUDA_CHECK(cudaFree(V1));  CUDA_CHECK(cudaFree(V2));
-    CUDA_CHECK(cudaFree(A2));  CUDA_CHECK(cudaFree(A4));  CUDA_CHECK(cudaFree(A6));
-    CUDA_CHECK(cudaFree(d_z)); CUDA_CHECK(cudaFree(d_id));
 }
 
 int main(){
@@ -711,229 +787,46 @@ int main(){
 
     // start timing
     start = std::chrono::high_resolution_clock::now();
+    
+    // create handles
+    cuHandles x;
 
     // device pointers
     cuFloatComplex* d_A;
     CUDA_CHECK(cudaMalloc(&d_A, dim * dim * sizeof(cuFloatComplex)));
     CUDA_CHECK(cudaMemcpy(d_A, A, dim * dim * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
 
-    // create handles
-    cuHandles x;
+    // batch size and tolerance
+    float tol = 0.01;
+    int batch_size = dim / 5;
 
-    // memory for balancing
-    float* y; CUDA_CHECK(cudaMalloc(&y, dim * sizeof(float)));
+    // device memory for matrix balancing
+    int* d_update;         CUDA_CHECK(cudaMalloc(&d_update, batch_size * sizeof(int)));                        // which indices to update at each step
+    float* y;              CUDA_CHECK(cudaMalloc(&y, dim * sizeof(float)));                                    // balancing vector
+    float* cNorms;         CUDA_CHECK(cudaMalloc(&cNorms, dim * sizeof(float)));                               // column norms
+    float* rNorms;         CUDA_CHECK(cudaMalloc(&rNorms, dim * sizeof(float)));                               // row norms
+    float* tNorms;         CUDA_CHECK(cudaMalloc(&tNorms, (dim * (1 + (1 + dim / 128) / 2) * sizeof(float)))); // temporary memory for reductions
+    float* d_err;          CUDA_CHECK(cudaMalloc(&d_err, dim * sizeof(float)));                                // error in each row/col pair
+    cuFloatComplex* tempA; CUDA_CHECK(cudaMalloc(&tempA, dim * dim * sizeof(cuFloatComplex)));                 // space for adjustment of A on each iteration
+    
+    // host memory for matrix balancing
+    int* h_update = new int[dim];  // host copy of d_update for use with quicksort
+    int* idx_list = new int[dim];  // ordered indexing to reset h_update for quicksorting
+    float* h_err = new float[dim]; // host copy of d_err for use with quicksort
+
+    // fill out idx_list, h_update
+    for (int i = 0; i < dim; i++) idx_list[i] = i;
+    memcpy(h_update, idx_list, dim * sizeof(int));
 
     // zero out vector y
     balance_matrix_zero_y <<< 1 + dim / 128, 128 >>> (y, dim);
     CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
 
-    // memory for a copy of A for iterating
-    cuFloatComplex* tempA; CUDA_CHECK(cudaMalloc(&tempA, dim * dim * sizeof(cuFloatComplex)));
-
-    // memory for column, row norms
-    float* cNorms;  CUDA_CHECK(cudaMalloc(&cNorms, dim * sizeof(float)));
-    float* rNorms;  CUDA_CHECK(cudaMalloc(&rNorms, dim * sizeof(float)));
-
-    // memory for greedy indexing
-    float* d_weights; CUDA_CHECK(cudaMalloc(&d_weights, dim * sizeof(float)));
-    float* h_weights = new float[dim];
-    
-    // counter and batch information for iterating (batch = 20% of matrix at a time)
-    int counter = 0, batch_size = dim / 5;
-
-    // calculate column norms the old way
-    start = std::chrono::high_resolution_clock::now();
-    column_sum <<< 1 + dim / 128, 128 >>> (d_A, cNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The average elapsed time for the original calculation was " << duration.count() * 1000 << "ms" << std::endl;
-
-    // calculate the new way (need new memory)
-    float* tnorm; CUDA_CHECK(cudaMalloc(&tnorm, (dim * dim / 128) * sizeof(float)));
-    start = std::chrono::high_resolution_clock::now();
-    column_norm(d_A, tnorm, dim);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The average elapsed time for the new calculation was " << duration.count() * 1000 << "ms" << std::endl;
-
-    start = std::chrono::high_resolution_clock::now();
-    CUDA_CHECK(cudaDeviceSynchronize());
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-    std::cout << "The average elapsed time to synchronize the device was " << duration.count() * 1000 << "ms" << std::endl;
-
-    // memory for copying to host
-    float* h_norms = new float[dim];
-
-    // write both norms to file
-    std::string name1 = "old";
-    std::string name2 = "new";
-    CUDA_CHECK(cudaMemcpy(h_norms, cNorms, dim * sizeof(float), cudaMemcpyDeviceToHost));
-    write_array_to_file_S(h_norms, name1, dim);
-    CUDA_CHECK(cudaMemcpy(h_norms, tnorm, dim * sizeof(float), cudaMemcpyDeviceToHost));
-    write_array_to_file_S(h_norms, name2, dim);
-
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    /*
-    // memory for finding indices to adjust in each interation
-    int* h_update = new int[dim];
-    int* d_update; CUDA_CHECK(cudaMalloc(&d_update, batch_size * sizeof(int)));
-    
-    // index array for sorting
-    int* idx_list = new int[dim];
-    for (int i = 0; i < dim; i++) idx_list[i] = i;
-    memcpy(h_update, idx_list, dim * sizeof(int));
-
-    // memory for errors
-    float* h_err = new float[dim];
-    float* d_err; CUDA_CHECK(cudaMalloc(&d_err, dim * sizeof(float)));
-
     // start timing
     auto net_start = std::chrono::high_resolution_clock::now();
 
-    // calculate norms
-    column_sum <<< 1 + dim / 128, 128 >>> (d_A, cNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-    row_sum <<< 1 + dim / 128, 128 >>> (d_A, rNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // calculate errors
-    balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_err, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // move to host for sorting
-    CUDA_CHECK(cudaMemcpy(h_err, d_err, dim * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // sort the weights to get worst matches
-    quick_sort(h_err, h_update, 0, dim - 1);
-
-    // tolerance for balancing & value zero for weights
-    float tol = 0.01;
-
-    // loop until within tolerance, or hit 5,000 iterations
-    while (h_err[0] > 1 + tol){
-
-        // if go too long, kill it
-        if (counter > 5000){
-            std::cout << "Unable to balance within 5,000 iterations. Ending balancing and outputting most recent balancing parameters." << std::endl;
-            break;
-        }
-
-        // copy worst indices for update list to device
-        CUDA_CHECK(cudaMemcpy(d_update, h_update, batch_size * sizeof(int), cudaMemcpyHostToDevice));
-
-        // make the adjustment to y
-        balance_matrix_adjust_y <<< 1 + batch_size / 128, 128 >>> (y, cNorms, rNorms, d_update, batch_size); // add a -1 if getting direct from greedy indexing
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // do the balancing step
-        balance_matrix_adjust_A <<< 1 + (dim * dim) / 128, 128 >>> (d_A, tempA, y, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());     
-
-        // calculate all norms
-        column_sum <<< 1 + dim / 128, 128 >>> (tempA, cNorms, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-        row_sum <<< 1 + dim / 128, 128 >>> (tempA, rNorms, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());   
-
-        // calculate errors
-        balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, d_err, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // copy weights to host
-        CUDA_CHECK(cudaMemcpy(h_err, d_err, dim * sizeof(float), cudaMemcpyDeviceToHost));
-
-        // reset update array for next sort
-        memcpy(h_update, idx_list, dim * sizeof(int));
-
-        // sort the weights to get worst matches
-        quick_sort(h_err, h_update, 0, dim - 1);
-
-        // update counter
-        counter = counter + batch_size;
-    }
-
-    */
-
-    /*
-
-    // memory for finding indices to adjust in each interation
-    int* update; CUDA_CHECK(cudaMallocManaged(&update, batch_size * sizeof(int)));
-    
-    // index array for sorting
-    int* idx_list = new int[dim];
-    for (int i = 0; i < dim; i++) idx_list[i] = i;
-    memcpy(update, idx_list, dim * sizeof(int));
-
-    // memory for errors
-    float* err; CUDA_CHECK(cudaMallocManaged(&err, dim * sizeof(float)));
-
-    // start timing
-    auto net_start = std::chrono::high_resolution_clock::now();
-
-    // calculate norms
-    column_sum <<< 1 + dim/128, 128 >>> (d_A, cNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-    row_sum <<< 1 + dim/128, 128 >>> (d_A, rNorms, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // calculate errors
-    balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
-    CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-    // get the maximal error = epsilon
-    quick_sort(err, update, 0, dim - 1);
-
-    // tolerance for balancing & value zero for weights
-    float tol = 0.01;
-
-    // loop until within tolerance, or hit 5,000 iterations
-    while (err[0] > 1 + tol){
-
-        // if go too long, kill it
-        if (counter > 5000){
-            std::cout << "Unable to balance within 5,000 iterations. Ending balancing and outputting most recent balancing parameters." << std::endl;
-            break;
-        }
-
-        // make the adjustment to y
-        balance_matrix_adjust_y <<< 1 + batch_size/128, 128 >>> (y, cNorms, rNorms, update, batch_size); // add a -1 if getting direct from greedy indexing
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // do the balancing step
-        balance_matrix_adjust_A <<< 1 + (dim * dim)/128, 128 >>> (d_A, tempA, y, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());     
-
-        // calculate all norms
-        column_sum <<< 1 + dim/128, 128 >>> (tempA, cNorms, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-        row_sum <<< 1 + dim/128, 128 >>> (tempA, rNorms, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());   
-
-        // calculate errors
-        balance_matrix_calc_errors <<< 1 + dim/128, 128 >>> (cNorms, rNorms, err, dim);
-        CUDA_CHECK(cudaPeekAtLastError()); CUDA_CHECK(cudaDeviceSynchronize());
-
-        // reset update array for next sort
-        memcpy(update, idx_list, dim * sizeof(int));
-
-        // sort the weights to get worst matches
-        quick_sort(err, update, 0, dim - 1);
-
-        // update counter
-        counter = counter + batch_size;
-    }
-
-    */
-
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    /*
-    // print balancing iterations
-    std::cout << "The number of iterations to balance was " << counter << std::endl;
+    // run the alg with tol = 0.01, dim/5 batch size, print out iterations
+    batch_greedy_osborne_no_alloc(d_A, tol, batch_size, d_update, h_update, idx_list, x, cNorms, rNorms, tNorms, dim, d_err,  h_err, y, tempA, 1);
 
     // print time of execution
     cudaDeviceSynchronize();
@@ -948,8 +841,6 @@ int main(){
     // write balancing vector to file
     std::string y_name = "Y";
     write_array_to_file_S(h_y, y_name, dim);
-
-    */
 
     // return
     return 0;

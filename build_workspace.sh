@@ -6,5 +6,4 @@ cp /mnt/c/Users/charl/Desktop/quantum_cuda_toolkit/imag_A.txt ~/quantum_cuda_too
 /usr/local/cuda-11.8/bin/nvcc workspace.cu /usr/local/cuda-11.8/lib64/libcusolver.so /usr/local/cuda-11.8/lib64/libcublas.so /usr/local/cuda-11.8/lib64/libcublasLt.so -o test_build
 ./test_build
 
-cp ~/quantum_cuda_toolkit/new.txt /mnt/c/Users/charl/Desktop/quantum_cuda_toolkit/new.txt -r
-cp ~/quantum_cuda_toolkit/old.txt /mnt/c/Users/charl/Desktop/quantum_cuda_toolkit/old.txt -r
+cp ~/quantum_cuda_toolkit/Y.txt /mnt/c/Users/charl/Desktop/quantum_cuda_toolkit/Y.txt -r

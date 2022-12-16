@@ -25,6 +25,141 @@ class cuHandles{
         }
 };
 
+// STRUCTURE TO HOLD POINTERS, MUST MANUALLY FREE AND ALLOCATE
+struct dataHolder{
+
+    // FINAL OUTPUT OF expm ALGORITHM
+    cuFloatComplex* d_X;
+
+    // PRE/POST-PROCESSING POINTERS
+
+        // host pointers
+        cuFloatComplex* TrA; // trace of the matrix being exponentiated
+        float* h_err; // for matrix balancing: errors of each index in matrix for greedy indexing
+        float* tol; // for matrix balancing: the error toleranace
+        int* nsquares; // number of squarings necessary to undo scaling
+        int* h_update; // for matrix balancing: which rows/column indices to udpate at each step
+        int* idx_list; // for matrix balancing: base version of h_update to reset before sorting
+        int* batch_size; // for matrix balancing: the how many indices you want to update at each step
+
+        // device pointers
+        cuFloatComplex* d_mid; // the value -1
+        cuFloatComplex* d_x; cuFloatComplex* d_y; // intermediate storage for squaring in post-processing
+        cuFloatComplex* tempA; // for matrix balancing: temporary storage for each update of A during balancing
+        float* tNorms; // temporary memory for reductions for norm calculations
+        float* cNorms; // for matrix balancing: column norms of matrix to exponentiate
+        float* rNorms; // for matrix balancing: row norms of matrix to exponentiate
+        float* d_err; // for matrix balancing: errors of each index in matrix for greedy indexing
+        float* y; // for matrix balancing: the balancing vector, output of balancing algorithm
+        int* d_update; // for matrix balancing: which rows/column indices to udpate at each step
+
+    // CALCULATION OF P AND Q POINTERS
+
+        // host pointers
+        cuFloatComplex* C; // pade approximant coefficients
+
+        // device pointers
+        cuFloatComplex* d_z; // the value zero on the device
+        cuFloatComplex* d_id; // the value 1 on the device
+        cuFloatComplex* A2; // to hold the square of A
+        cuFloatComplex* A4; // to hold A to the 4th
+        cuFloatComplex* A6; // to hold A to the 6th
+        cuFloatComplex* U1; cuFloatComplex* U2; cuFloatComplex* V1; cuFloatComplex* V2; // intermediate storage for P, Q calculation
+        cuFloatComplex* d_P; // numerator of pade approximant
+        cuFloatComplex* d_Q; // denominator of pade approximant
+
+    // LINSOLVE POINTERS
+
+        // device pointers
+        int* d_ipiv; // pivot info for solver
+        int* devInfo; // output for success/failure of solver
+};
+
+dataHolder prep_expm_memory(int dim){
+
+    // CREATE THE STRUCTURE
+    dataHolder x;
+
+    // FINAL OUTPUT OF expm ALGORITHM
+    CUDA_CHECK(cudaMalloc(&x.d_X, dim * dim * sizeof(cuFloatComplex)));
+
+    // PRE/POST-PROCESSING POINTERS
+
+        // host pointers
+        x.TrA = (cuFloatComplex*) malloc(sizeof(cuFloatComplex)); // trace of the matrix being exponentiated
+        x.h_err = (float*) malloc(dim * sizeof(float)); // for matrix balancing: errors of each index in matrix for greedy indexing
+        x.tol = (float*) malloc(sizeof(float)); *x.tol = 0.01; // for matrix balancing: the error toleranace, default value of 0.01;
+        x.nsquares = (int*) malloc(sizeof(int)); // number of squarings necessary to undo scaling
+        x.h_update = (int*) malloc(dim * sizeof(int)); // for matrix balancing: which rows/column indices to udpate at each step
+        x.idx_list = (int*) malloc(dim * sizeof(int)); // for matrix balancing: base version of h_update to reset before sorting
+        x.batch_size = (int*) malloc(sizeof(int)); *x.batch_size = dim / 5; // for matrix balancing: the how many indices you want to update at each step, default value of 1/5 the matrix at a time
+
+        // device pointers
+        CUDA_CHECK(cudaMalloc(&x.d_mid, sizeof(cuFloatComplex))); // the value -1
+        CUDA_CHECK(cudaMalloc(&x.d_x, dim * dim * sizeof(cuFloatComplex))); // intermediate storage for squaring in post-processing
+        CUDA_CHECK(cudaMalloc(&x.d_y, dim * dim * sizeof(cuFloatComplex))); // intermediate storage for squaring in post-processing
+        CUDA_CHECK(cudaMalloc(&x.tempA, dim * dim * sizeof(cuFloatComplex))); // for matrix balancing: temporary storage for each update of A during balancing
+        CUDA_CHECK(cudaMalloc(&x.tNorms, (dim * (1 + (1 + dim / 128) / 2) * sizeof(float)))); // temporary memory for reductions for norm calculations
+        CUDA_CHECK(cudaMalloc(&x.cNorms, dim * sizeof(float))); // for matrix balancing: column norms of matrix to exponentiate
+        CUDA_CHECK(cudaMalloc(&x.rNorms, dim * sizeof(float))); // for matrix balancing: row norms of matrix to exponentiate
+        CUDA_CHECK(cudaMalloc(&x.d_err, dim * sizeof(float))); // for matrix balancing: errors of each index in matrix for greedy indexing
+        CUDA_CHECK(cudaMalloc(&x.y, dim * sizeof(float))); // for matrix balancing: the balancing vector, output of balancing algorithm
+        CUDA_CHECK(cudaMalloc(&x.d_update, (*x.batch_size) * sizeof(int))); // for matrix balancing: which rows/column indices to udpate at each step
+
+    // CALCULATION OF P AND Q POINTERS
+
+        // host pointers
+        x.C = (cuFloatComplex*) malloc(14 * sizeof(cuFloatComplex)); // pade approximant coefficients
+
+        // device pointers
+        CUDA_CHECK(cudaMalloc(&x.d_z, sizeof(cuFloatComplex))); // the value zero on the device
+        CUDA_CHECK(cudaMalloc(&x.d_id, sizeof(cuFloatComplex))); // the value 1 on the device
+        CUDA_CHECK(cudaMalloc(&x.A2, dim * dim * sizeof(cuFloatComplex))); // to hold the square of A
+        CUDA_CHECK(cudaMalloc(&x.A4, dim * dim * sizeof(cuFloatComplex))); // to hold A to the 4th
+        CUDA_CHECK(cudaMalloc(&x.A6, dim * dim * sizeof(cuFloatComplex))); // to hold A to the 6th
+        CUDA_CHECK(cudaMalloc(&x.U1, dim * dim * sizeof(cuFloatComplex))); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaMalloc(&x.U2, dim * dim * sizeof(cuFloatComplex))); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaMalloc(&x.V1, dim * dim * sizeof(cuFloatComplex))); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaMalloc(&x.V2, dim * dim * sizeof(cuFloatComplex))); // intermediate storage for P, Q calculation
+        CUDA_CHECK(cudaMalloc(&x.d_P, dim * dim * sizeof(cuFloatComplex))); // numerator of pade approximant
+        CUDA_CHECK(cudaMalloc(&x.d_Q, dim * dim * sizeof(cuFloatComplex))); // denominator of pade approximant
+
+    // LINSOLVE POINTERS
+
+        // device pointers
+        CUDA_CHECK(cudaMalloc(&x.d_ipiv, dim * sizeof(int))); // pivot info for solver
+        CUDA_CHECK(cudaMalloc(&x.devInfo, sizeof(int))); // output for success/failure of solver
+
+    // INITIALIZE VALUES
+
+        // value 1, -1, and 0
+        cuFloatComplex h_mid = make_cuFloatComplex(-1,0); CUDA_CHECK(cudaMemcpy(x.d_mid, &h_mid, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+        cuFloatComplex h_id = make_cuFloatComplex(1, 0); CUDA_CHECK(cudaMemcpy(x.d_id, &h_id, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+        cuFloatComplex h_z = make_cuFloatComplex(0, 0); CUDA_CHECK(cudaMemcpy(x.d_z, &h_z, sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+
+        // pade approximant polynomial values
+        x.C[0] = make_cuFloatComplex(float(64764752532480000), float(0));
+        x.C[1] = make_cuFloatComplex(float(32382376266240000), float(0));
+        x.C[2] = make_cuFloatComplex(float(7771770303897600), float(0));
+        x.C[3] = make_cuFloatComplex(float(1187353796428800), float(0));
+        x.C[4] = make_cuFloatComplex(float(129060195264000), float(0));
+        x.C[5] = make_cuFloatComplex(float(10559470521600), float(0));
+        x.C[6] = make_cuFloatComplex(float(670442572800), float(0));
+        x.C[7] = make_cuFloatComplex(float(33522128640), float(0));
+        x.C[8] = make_cuFloatComplex(float(1323241920), float(0));
+        x.C[9] = make_cuFloatComplex(float(40840800), float(0));
+        x.C[10] = make_cuFloatComplex(float(960960), float(0));
+        x.C[11] = make_cuFloatComplex(float(16380), float(0));
+        x.C[12] = make_cuFloatComplex(float(182), float(0));
+        x.C[13] = make_cuFloatComplex(float(1), float(0));
+
+        // index list for balancing
+        for (int i = 0; i < dim; i++) x.idx_list[i] = i;
+
+    // return the structure
+    return x;
+}
+
 // MATRIX OPERATIONS
 __global__ void kron(cuFloatComplex* A, cuFloatComplex* B, cuFloatComplex* C, int dim_A, int dim_B){
 
