@@ -10,13 +10,11 @@ no promises how good or standard anything is, i'm self taught in both cuda and c
 
 ## current tasks
 
--implementing efficient matrix balancing using greedy osborne for the pre-processing for exmp
-
--gpu sorting algo to reduce need for memory transfers between host and device (for identifying greedy osborne indices and updating in batches)
+-documenting expm algorithm
 
 ## current working functions:
 
--expm (matrix exponent) for complex single precision, still being worked on, basics work, uses scaling & squaring algorithm
+-expm (matrix exponent) for complex single precision: uses scaling & squaring algorithm with preprocessing using osborne's algo for matrix balancing.  current performance advantage over matlab for 5000 x 5000 = 48x faster run locally on a GTX 1080Ti.
 
 -eigen solver for complex single precision (built in with cuSolver, but reorganized to be easier to use)
 
